@@ -22,7 +22,7 @@
   <section id="cameraWrap">
     <video id="video" playsinline muted autoplay></video>
     <canvas id="canvas" hidden></canvas>
-    <div id="cameraPlaceholder">Tap <b>Start Scanning</b> and slowly pan across the shelves.</div>
+    <div id="cameraPlaceholder">Tap <b>Start Scanning</b>, then pause briefly on shelves and racks. It snaps a photo when the view is steady.</div>
     <div id="status" class="status">Idle</div>
     <div id="toast" class="toast" hidden></div>
   </section>
@@ -67,8 +67,12 @@
       <label>Minimum profit for a deal ($)
         <input id="minProfit" type="number" min="0" step="1" />
       </label>
-      <label>Take a photo every (seconds)
-        <input id="interval" type="number" min="0.5" max="30" step="0.5" />
+      <label>Auto-photo sensitivity
+        <select id="sensitivity">
+          <option value="low">Low: only when I stop and aim</option>
+          <option value="normal">Normal</option>
+          <option value="high">High: snap even while moving slowly</option>
+        </select>
       </label>
       <label class="row"><input id="vibrate" type="checkbox" /> Vibrate + beep on deals</label>
       <fieldset class="cats">

@@ -9,17 +9,30 @@ const MAX_IN_FLIGHT = 2;
 const MAX_QUEUE = 4;
 const MAX_PHOTOS = 150;
 const SEND_SIDE = 800;
-const SAME_SCENE_DIFF = 6;
+const WATCH_MS = 200;
+const MIN_GAP_MS = 1200;
+const SHARP_MIN = 3;
+const SENSITIVITY = {
+  low: { steadyMs: 900, still: 3, newScene: 9 },
+  normal: { steadyMs: 600, still: 5, newScene: 6 },
+  high: { steadyMs: 400, still: 8, newScene: 4 },
+};
 
 const settings = Object.assign(
-  { provider: "demo", apiKey: "", model: "", minProfit: 15, interval: 1.5, vibrate: true, categories: [] },
+  { provider: "demo", apiKey: "", model: "", minProfit: 15, sensitivity: "normal", vibrate: true, categories: [] },
   JSON.parse(localStorage.getItem("ts-settings") || "{}")
 );
 let items = JSON.parse(localStorage.getItem("ts-items") || "[]");
 
 let stream = null;
 let scanning = false;
-let captureTimer = null;
+let watchTimer = null;
+let prevSig = null;
+let steadyFor = 0;
+let sharpHistory = [];
+let lastShotAt = 0;
+let aiming = false;
+const scoutDebug = (window.scoutDebug = { motion: 0, sharp: 0, steadyFor: 0, isNew: false });
 let wakeLock = null;
 let pausedUntil = 0;
 let audioCtx = null;
@@ -105,7 +118,7 @@ $("settingsBtn").onclick = () => {
   $("model").value = settings.model;
   $("model").placeholder = DEFAULT_MODELS[settings.provider] || "auto";
   $("minProfit").value = settings.minProfit;
-  $("interval").value = settings.interval;
+  $("sensitivity").value = settings.sensitivity in SENSITIVITY ? settings.sensitivity : "normal";
   $("vibrate").checked = settings.vibrate;
   $("catList").replaceChildren(
     ...CATEGORIES.map((c) => {
@@ -127,7 +140,7 @@ $("saveSettings").onclick = () => {
   settings.apiKey = $("apiKey").value.trim();
   settings.model = $("model").value.trim();
   settings.minProfit = Math.max(0, Number($("minProfit").value) || 0);
-  settings.interval = Math.min(30, Math.max(0.5, Number($("interval").value) || 1.5));
+  settings.sensitivity = $("sensitivity").value;
   settings.vibrate = $("vibrate").checked;
   settings.categories = [...$("catList").querySelectorAll("input:checked")].map((cb) => cb.value);
   saveSettings();
@@ -169,17 +182,21 @@ async function start() {
   }
   scanning = true;
   lastSignature = null;
+  prevSig = null;
+  steadyFor = 0;
+  sharpHistory = [];
   $("recordBtn").textContent = "Stop Scanning";
   $("recordBtn").classList.add("on");
   try { wakeLock = await navigator.wakeLock?.request("screen"); } catch {}
   unlockAudio();
-  captureLoop();
+  watchLoop();
   updateStatus();
 }
 function stop() {
   scanning = false;
   $("labelBtn").textContent = "Label";
-  clearTimeout(captureTimer);
+  clearTimeout(watchTimer);
+  aiming = false;
   queue.length = 0;
   stopCamera();
   $("recordBtn").textContent = "Start Scanning";
@@ -191,23 +208,81 @@ function stop() {
 $("recordBtn").onclick = () => (scanning ? stop() : start());
 
 // ---------- Capture → queue → parallel analysis ----------
-function captureLoop() {
+// Watches the camera on-device and only takes a photo when the view is steady, sharp, and new.
+function watchLoop() {
   if (!scanning) return;
-  const frame = captureFrame();
-  if (frame || settings.provider === "demo") {
-    if (frame && isSameScene(frame.signature)) {
-      stats.skipped++;
-    } else {
-      if (frame) lastSignature = frame.signature;
-      stats.photos++;
-      queue.push({ id: `p${Date.now()}`, dataUrl: frame?.dataUrl || null, takenAt: Date.now() });
-      while (queue.length > MAX_QUEUE) queue.shift();
-      pump();
+  watchTimer = setTimeout(watchLoop, WATCH_MS);
+  if (!stream) {
+    if (settings.provider === "demo" && Date.now() - lastShotAt > 3000) {
+      lastShotAt = Date.now();
+      enqueue(null);
+    }
+    return;
+  }
+  const look = lookAtFrame();
+  if (!look) return;
+  const cfg = SENSITIVITY[settings.sensitivity] || SENSITIVITY.normal;
+  const motion = prevSig ? meanDiff(look.sig, prevSig) : 255;
+  prevSig = look.sig;
+  steadyFor = motion < cfg.still ? steadyFor + WATCH_MS : 0;
+  sharpHistory.push(look.sharp);
+  if (sharpHistory.length > 6) sharpHistory.shift();
+  const sharpEnough = look.sharp >= SHARP_MIN && look.sharp >= 0.75 * Math.max(...sharpHistory);
+  const isNew = !lastSignature || meanDiff(look.sig, lastSignature) >= cfg.newScene;
+  aiming = steadyFor > 0 && isNew;
+  Object.assign(scoutDebug, { motion, sharp: look.sharp, steadyFor, isNew });
+  if (steadyFor >= cfg.steadyMs && sharpEnough && isNew && Date.now() - lastShotAt >= MIN_GAP_MS) {
+    const frame = captureFrame();
+    if (!frame) return;
+    lastSignature = look.sig;
+    lastShotAt = Date.now();
+    steadyFor = 0;
+    aiming = false;
+    enqueue(frame.dataUrl);
+    snapFlash();
+  }
+}
+
+function enqueue(dataUrl) {
+  stats.photos++;
+  queue.push({ id: `p${Date.now()}`, dataUrl, takenAt: Date.now() });
+  while (queue.length > MAX_QUEUE) queue.shift();
+  pump();
+  updateStatus();
+}
+
+function snapFlash() {
+  const w = $("cameraWrap");
+  w.classList.add("snap");
+  setTimeout(() => w.classList.remove("snap"), 250);
+}
+
+const lookCanvas = document.createElement("canvas");
+function lookAtFrame() {
+  const v = $("video");
+  if (!v.videoWidth) return null;
+  const W = 160, H = Math.max(1, Math.round((160 * v.videoHeight) / v.videoWidth));
+  lookCanvas.width = W;
+  lookCanvas.height = H;
+  const ctx = lookCanvas.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(v, 0, 0, W, H);
+  const px = ctx.getImageData(0, 0, W, H).data;
+  const g = new Float32Array(W * H);
+  for (let i = 0; i < g.length; i++) g[i] = (px[i * 4] + px[i * 4 + 1] + px[i * 4 + 2]) / 3;
+  let lap = 0;
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      const i = y * W + x;
+      lap += Math.abs(4 * g[i] - g[i - 1] - g[i + 1] - g[i - W] - g[i + W]);
     }
   }
-  updateStatus();
-  captureTimer = setTimeout(captureLoop, settings.interval * 1000);
+  return { sig: sceneSignature(lookCanvas), sharp: lap / ((W - 2) * (H - 2)) };
 }
+const meanDiff = (a, b) => {
+  let d = 0;
+  for (let i = 0; i < a.length; i++) d += Math.abs(a[i] - b[i]);
+  return d / a.length;
+};
 
 function captureFrame(side = SEND_SIDE, quality = 0.75) {
   const v = $("video");
@@ -231,13 +306,6 @@ function sceneSignature(canvas) {
   for (let i = 0; i < 256; i++) sig[i] = (px[i * 4] + px[i * 4 + 1] + px[i * 4 + 2]) / 3;
   return sig;
 }
-function isSameScene(sig) {
-  if (!lastSignature) return false;
-  let diff = 0;
-  for (let i = 0; i < sig.length; i++) diff += Math.abs(sig[i] - lastSignature[i]);
-  return diff / sig.length < SAME_SCENE_DIFF;
-}
-
 function pump() {
   while (inFlight < MAX_IN_FLIGHT && queue.length && Date.now() >= pausedUntil) {
     const job = queue.pop();
@@ -648,6 +716,7 @@ function updateStatus() {
   if (Date.now() < noteUntil) return;
   if (!scanning) return setStatus(stream ? "Label mode · point at a tag, tap Snap Label" : "Idle", !!stream);
   const parts = [`${stats.photos} photos`];
+  if (aiming) parts.push("hold steady to snap");
   if (inFlight || queue.length) parts.push(`analyzing ${inFlight + queue.length}`);
   const wait = Math.ceil((pausedUntil - Date.now()) / 1000);
   if (wait > 0) {

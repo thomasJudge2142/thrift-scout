@@ -77,3 +77,4 @@ fieldset.cats { border:1px solid #334155; border-radius:.5rem; padding:.5rem .7r
 fieldset.cats legend { font-size:.8rem; color:var(--muted); padding:0 .3rem; }
 #catList { display:grid; grid-template-columns:repeat(2,1fr); gap:.3rem .6rem; }
 #catList .cat { display:flex; align-items:center; gap:.3rem; font-size:.9rem; margin:0; }
+#cameraWrap.snap::after { content:""; position:absolute; inset:0; border:4px solid var(--accent); background:rgba(255,255,255,.12); pointer-events:none; z-index:5; }
