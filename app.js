@@ -840,7 +840,9 @@ function itemEl(it) {
 const ebayUrl = (it) => `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(it.name)}&LH_Sold=1&LH_Complete=1`;
 
 let viewerUrl = null;
+let viewerItem = null;
 async function openViewer(it) {
+  viewerItem = it;
   const blob = it.photoId ? await getPhoto(it.photoId).catch(() => null) : null;
   if (viewerUrl) URL.revokeObjectURL(viewerUrl);
   viewerUrl = blob ? URL.createObjectURL(blob) : null;
@@ -857,8 +859,138 @@ async function openViewer(it) {
   $("viewerMeta").textContent = `Seen ${ago(it.seenAt)} · ${it.why}` + (it.labelText ? ` · Label: "${it.labelText}"` : "");
   $("viewerPrices").innerHTML = pricesHtml(it) + `<span class="profit${it.profit < 0 ? " neg" : ""}">Profit: ${money(it.profit)}</span>`;
   $("viewerLink").href = ebayUrl(it);
+  renderLookup(it);
   renderViewerActions(it);
   if (!$("viewer").open) $("viewer").showModal();
+}
+
+// ---------- Look it up (Gemini + Google Search) ----------
+const LOOKUP_MODELS = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-flash-lite-latest"];
+let lookupError = null;
+
+function lookupPrompt(it) {
+  const where = it.box ? ` It is inside box_2d ${JSON.stringify(it.box)} ([ymin, xmin, ymax, xmax], 0-1000 scale).` : "";
+  const label = it.labelText ? ` Its label reads: "${it.labelText}".` : "";
+  return `This photo is from a thrift store. Focus on the item described as "${it.name}".${where}${label}
+1. Identify it as precisely as possible (maker, model or pattern, era).
+2. Use Google Search to find what this item has recently SOLD for (eBay sold listings, Etsy, auctions, Poshmark, Mercari). Prefer sold prices over asking prices.
+Reply ONLY with JSON: {"name": "...", "sold_low": number, "sold_high": number, "evidence": "one short sentence on what you found"}. Use null prices if you found none.`;
+}
+
+const blobToB64 = (blob) =>
+  new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).split(",")[1]);
+    r.onerror = () => reject(r.error);
+    r.readAsDataURL(blob);
+  });
+
+async function lookupItem(it) {
+  if (settings.provider === "demo") {
+    await new Promise((r) => setTimeout(r, 800));
+    const mid = Math.max(10, Math.round((it.low + it.high) / 2));
+    return { name: it.name, low: Math.round(mid * 0.8), high: Math.round(mid * 1.3), evidence: "Demo mode: not a real web lookup.", sources: [] };
+  }
+  if (settings.provider !== "gemini") throw new Error("Look it up only works with Google Gemini. Switch the AI provider in Settings.");
+  if (!settings.apiKey) throw new Error("Add your Gemini key in Settings first.");
+  const blob = it.photoId ? await getPhoto(it.photoId).catch(() => null) : null;
+  const parts = [{ text: lookupPrompt(it) }];
+  if (blob) parts.push({ inline_data: { mime_type: blob.type || "image/jpeg", data: await blobToB64(blob) } });
+  const chain = [...new Set([settings.model, ...LOOKUP_MODELS].filter(Boolean))];
+  let lastErr;
+  for (const model of chain) {
+    const generationConfig = { temperature: 0.2 };
+    if (!geminiNoThinking.has(model)) generationConfig.thinkingConfig = { thinkingLevel: "low" };
+    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": settings.apiKey },
+      body: JSON.stringify({ contents: [{ parts }], tools: [{ google_search: {} }], generationConfig }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) {
+      const cand = data.candidates?.[0] || {};
+      const text = cand.content?.parts?.map((p) => p.text || "").join("") || "";
+      const m = text.match(/\{[\s\S]*\}/);
+      let j = {};
+      try { j = m ? JSON.parse(m[0]) : {}; } catch {}
+      const sources = (cand.groundingMetadata?.groundingChunks || [])
+        .map((c) => c.web)
+        .filter((w) => w?.uri)
+        .slice(0, 4)
+        .map((w) => ({ title: String(w.title || w.uri).slice(0, 80), uri: w.uri }));
+      return { name: String(j.name || it.name).slice(0, 120), low: num(j.sold_low), high: num(j.sold_high), evidence: String(j.evidence || text).slice(0, 240), sources };
+    }
+    const details = JSON.stringify(data.error?.details || []);
+    lastErr = httpError(res, data.error?.message || "");
+    if (res.status === 400 && /thinking/i.test(lastErr.message) && !geminiNoThinking.has(model)) {
+      geminiNoThinking.add(model);
+      chain.splice(chain.indexOf(model) + 1, 0, model);
+      continue;
+    }
+    if (res.status === 429 && /PerDay/.test(details)) continue;
+    if ((res.status === 429 && !/retryDelay/.test(details)) || res.status === 403) {
+      lastErr.needsBilling = true;
+      continue;
+    }
+    if ([400, 404, 500, 503].includes(res.status)) continue;
+    break;
+  }
+  throw lastErr || new Error("Lookup failed");
+}
+
+async function runLookup(it, button) {
+  button.disabled = true;
+  button.textContent = "Searching the web…";
+  lookupError = null;
+  try {
+    const r = await lookupItem(it);
+    it.lookup = { ...r, at: Date.now() };
+    if (r.name) it.name = r.name;
+    if (r.low != null) {
+      it.low = r.low;
+      it.high = r.high ?? r.low;
+      it.profit = Math.round(((it.low + it.high) / 2 * (1 - FEE_RATE) - it.cost) * 100) / 100;
+      it.confidence = Math.max(it.confidence, MIN_CONFIDENCE);
+    }
+    it.deal = isDeal(it);
+    persist();
+    render();
+  } catch (e) {
+    console.error(e);
+    lookupError = { item: it, message: e.needsBilling
+      ? "Look it up needs billing turned on for your Gemini key (Google doesn't allow web search on free keys). Turn it on at aistudio.google.com/apikey, then try again."
+      : `Lookup failed: ${e.message}` };
+  }
+  if (viewerItem === it && $("viewer").open) openViewer(it);
+}
+
+function renderLookup(it) {
+  const box = $("viewerLookup");
+  const parts = [];
+  if (lookupError && lookupError.item === it) {
+    const p = document.createElement("div");
+    p.className = "err";
+    p.textContent = lookupError.message;
+    parts.push(p);
+  } else if (it.lookup) {
+    const l = it.lookup;
+    const head = document.createElement("div");
+    head.className = "head";
+    head.textContent = l.low != null ? `Web lookup: sold ${money(l.low)}–${money(l.high ?? l.low)}` : "Web lookup: no sold prices found";
+    const ev = document.createElement("div");
+    ev.textContent = l.evidence;
+    parts.push(head, ev);
+    for (const s of l.sources || []) {
+      const a = document.createElement("a");
+      a.href = s.uri;
+      a.target = "_blank";
+      a.rel = "noopener";
+      a.textContent = s.title;
+      parts.push(a);
+    }
+  }
+  box.replaceChildren(...parts);
+  box.hidden = !parts.length;
 }
 
 // ---------- Haul tracker ----------
@@ -892,6 +1024,8 @@ function renderViewerActions(it) {
     return b;
   };
   const buttons = [];
+  const look = btn(it.lookup ? "Look up again" : "Look it up", () => runLookup(it, look));
+  buttons.push(look);
   if (!it.status) {
     buttons.push(btn("I bought it", () => {
       const paid = askPrice("How much did you pay?", it.cost);
