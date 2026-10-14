@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f172a" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>Thrift Scout</title>
+  <link rel="manifest" href="manifest.json" />
+  <link rel="icon" href="icon.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="icon.svg" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <h1>Thrift Scout</h1>
+    <span id="modeBadge" class="badge">Demo</span>
+    <button id="settingsBtn" class="icon-btn" aria-label="Settings">&#9881;</button>
+  </header>
+
+  <section id="cameraWrap">
+    <video id="video" playsinline muted autoplay></video>
+    <canvas id="canvas" hidden></canvas>
+    <div id="cameraPlaceholder">Tap <b>Start Scanning</b> and slowly pan across the shelves.</div>
+    <div id="status" class="status">Idle</div>
+    <div id="toast" class="toast" hidden></div>
+  </section>
+
+  <div class="controls">
+    <button id="recordBtn" class="record">Start Scanning</button>
+  </div>
+
+  <section class="list-section">
+    <div class="tabs">
+      <button class="tab active" data-tab="deals">Deals <span id="dealCount">0</span></button>
+      <button class="tab" data-tab="seen">All items <span id="seenCount">0</span></button>
+    </div>
+    <ul id="dealsList" class="items"></ul>
+    <ul id="seenList" class="items" hidden></ul>
+    <p id="emptyMsg" class="empty">No deals yet. Start scanning!</p>
+    <button id="clearBtn" class="link-btn">Clear list</button>
+  </section>
+
+  <dialog id="settings">
+    <form method="dialog">
+      <h2>Settings</h2>
+      <label>AI provider
+        <select id="provider">
+          <option value="demo">Demo (fake results, no key)</option>
+          <option value="gemini">Google Gemini</option>
+          <option value="openai">OpenAI</option>
+        </select>
+      </label>
+      <label>API key
+        <input id="apiKey" type="password" autocomplete="off" placeholder="Stored only on this phone" />
+      </label>
+      <label>Model
+        <input id="model" type="text" placeholder="auto" />
+      </label>
+      <label>Minimum profit for a deal ($)
+        <input id="minProfit" type="number" min="0" step="1" />
+      </label>
+      <label>Scan every (seconds)
+        <input id="interval" type="number" min="1" max="30" step="1" />
+      </label>
+      <label class="row"><input id="vibrate" type="checkbox" /> Vibrate + beep on deals</label>
+      <div class="dialog-actions">
+        <button value="cancel" class="secondary">Cancel</button>
+        <button id="saveSettings" value="save">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>
