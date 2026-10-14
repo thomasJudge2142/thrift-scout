@@ -27,7 +27,7 @@ const GEMINI_FALLBACKS = ["gemini-flash-lite-latest", "gemini-3.8-flash", "gemin
 const FEE_RATE = 0.15;
 const MIN_CONFIDENCE = 0.5;
 const MAX_IN_FLIGHT = 2;
-const MAX_QUEUE = 4;
+const MAX_QUEUE = 12;
 const MAX_PHOTOS = 150;
 const SEND_SIDE = 800;
 const WATCH_MS = 200;
@@ -217,7 +217,6 @@ function stop() {
   $("labelBtn").textContent = "Label";
   clearTimeout(watchTimer);
   aiming = false;
-  queue.length = 0;
   stopCamera();
   $("recordBtn").textContent = "Start Scanning";
   $("recordBtn").classList.remove("on");
@@ -734,10 +733,12 @@ function flash(text, ms = 6000) {
 }
 function updateStatus() {
   if (Date.now() < noteUntil) return;
+  const pending = inFlight + queue.length;
+  if (!scanning && pending) return setStatus(`Stopped · finishing ${pending} photo${pending > 1 ? "s" : ""}…`, true);
   if (!scanning) return setStatus(stream ? "Label mode · point at a tag, tap Snap Label" : "Idle", !!stream);
   const parts = [`${stats.photos} photos`];
   if (aiming) parts.push("hold steady to snap");
-  if (inFlight || queue.length) parts.push(`analyzing ${inFlight + queue.length}`);
+  if (pending) parts.push(`analyzing ${pending}`);
   const wait = Math.ceil((pausedUntil - Date.now()) / 1000);
   if (wait > 0) {
     const label = lastError === "Free daily AI limit used up" ? "free daily AI limit used up" : "AI limit";
