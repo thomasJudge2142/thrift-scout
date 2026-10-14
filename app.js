@@ -1,7 +1,9 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const DEFAULT_MODELS = { gemini: "gemini-2.5-flash", openai: "gpt-4o-mini", demo: "" };
+const DEFAULT_MODELS = { gemini: "gemini-flash-latest", openai: "gpt-4o-mini", demo: "" };
+const GEMINI_FALLBACKS = ["gemini-flash-latest", "gemini-3.8-flash", "gemini-3.5-flash", "gemini-flash-lite-latest"];
+let geminiFallbackIdx = 0;
 const FEE_RATE = 0.15;
 const MIN_CONFIDENCE = 0.5;
 
@@ -130,7 +132,7 @@ async function tick() {
       setStatus(`Scanning… (${found.length} item${found.length === 1 ? "" : "s"} in view)`, true);
     } catch (e) {
       console.error(e);
-      if (e.status === 429) backoffUntil = Date.now() + 15000;
+      if (e.status === 429 || e.status === 503) backoffUntil = Date.now() + 15000;
       setStatus("Error: " + e.message, true);
     } finally {
       busy = false;
@@ -160,7 +162,23 @@ async function analyze(dataUrl) {
 }
 
 async function callGemini(b64) {
-  const model = settings.model || DEFAULT_MODELS.gemini;
+  const chain = settings.model ? [settings.model] : GEMINI_FALLBACKS;
+  let lastErr;
+  for (let n = 0; n < chain.length; n++) {
+    const idx = (geminiFallbackIdx + n) % chain.length;
+    try {
+      const text = await callGeminiModel(chain[idx], b64);
+      geminiFallbackIdx = idx;
+      return text;
+    } catch (e) {
+      lastErr = e;
+      if (![404, 500, 503].includes(e.status)) throw e;
+    }
+  }
+  throw lastErr;
+}
+
+async function callGeminiModel(model, b64) {
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
     {
