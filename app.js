@@ -2,6 +2,27 @@
 
 const $ = (id) => document.getElementById(id);
 const DEFAULT_MODELS = { gemini: "gemini-flash-lite-latest", openai: "gpt-4o-mini", demo: "" };
+const MODEL_CHOICES = {
+  gemini: [
+    ["", "Auto (recommended): fastest, switches when a limit is hit"],
+    ["gemini-flash-lite-latest", "Flash Lite: fastest (~1s per photo)"],
+    ["gemini-3.8-flash", "3.8 Flash: smarter, slower (~4s)"],
+    ["gemini-flash-latest", "Flash (latest)"],
+    ["gemini-3.5-flash", "3.5 Flash"],
+  ],
+  openai: [
+    ["", "Auto (recommended): GPT-4o mini"],
+    ["gpt-4o-mini", "GPT-4o mini: fast, cheap"],
+    ["gpt-4o", "GPT-4o: more accurate, pricier"],
+  ],
+  demo: [["", "No model needed in demo mode"]],
+};
+function fillModels(provider, selected = "") {
+  const choices = [...(MODEL_CHOICES[provider] || MODEL_CHOICES.demo)];
+  if (selected && !choices.some(([v]) => v === selected)) choices.push([selected, selected]);
+  $("model").replaceChildren(...choices.map(([v, label]) => new Option(label, v, false, v === selected)));
+  $("model").disabled = provider === "demo";
+}
 const GEMINI_FALLBACKS = ["gemini-flash-lite-latest", "gemini-3.8-flash", "gemini-flash-latest", "gemini-3.5-flash"];
 const FEE_RATE = 0.15;
 const MIN_CONFIDENCE = 0.5;
@@ -115,8 +136,7 @@ function updateBadge() {
 $("settingsBtn").onclick = () => {
   $("provider").value = settings.provider;
   $("apiKey").value = settings.apiKey;
-  $("model").value = settings.model;
-  $("model").placeholder = DEFAULT_MODELS[settings.provider] || "auto";
+  fillModels(settings.provider, settings.model);
   $("minProfit").value = settings.minProfit;
   $("sensitivity").value = settings.sensitivity in SENSITIVITY ? settings.sensitivity : "normal";
   $("vibrate").checked = settings.vibrate;
@@ -134,11 +154,11 @@ $("settingsBtn").onclick = () => {
   );
   $("settings").showModal();
 };
-$("provider").onchange = () => ($("model").placeholder = DEFAULT_MODELS[$("provider").value] || "auto");
+$("provider").onchange = () => fillModels($("provider").value);
 $("saveSettings").onclick = () => {
   settings.provider = $("provider").value;
   settings.apiKey = $("apiKey").value.trim();
-  settings.model = $("model").value.trim();
+  settings.model = $("model").value;
   settings.minProfit = Math.max(0, Number($("minProfit").value) || 0);
   settings.sensitivity = $("sensitivity").value;
   settings.vibrate = $("vibrate").checked;
