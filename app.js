@@ -27,7 +27,6 @@ const GEMINI_FALLBACKS = ["gemini-flash-lite-latest", "gemini-3.8-flash", "gemin
 const FEE_RATE = 0.15;
 const MIN_CONFIDENCE = 0.5;
 const MAX_IN_FLIGHT = 2;
-const MAX_QUEUE = 12;
 const MAX_PHOTOS = 150;
 const SEND_SIDE = 800;
 const WATCH_MS = 200;
@@ -100,22 +99,38 @@ const LABEL_SIDE = 1280;
 
 // ---------- Photo storage (IndexedDB) ----------
 const dbPromise = new Promise((resolve, reject) => {
-  const req = indexedDB.open("thrift-scout", 1);
-  req.onupgradeneeded = () => req.result.createObjectStore("photos");
+  const req = indexedDB.open("thrift-scout", 2);
+  req.onupgradeneeded = () => {
+    for (const name of ["photos", "pending"]) {
+      if (!req.result.objectStoreNames.contains(name)) req.result.createObjectStore(name);
+    }
+  };
   req.onsuccess = () => resolve(req.result);
   req.onerror = () => reject(req.error);
 });
-async function idb(mode, fn) {
+async function idb(mode, fn, store = "photos") {
   const db = await dbPromise;
   return new Promise((resolve, reject) => {
-    const tx = db.transaction("photos", mode);
-    const r = fn(tx.objectStore("photos"));
+    const tx = db.transaction(store, mode);
+    const r = fn(tx.objectStore(store));
     tx.oncomplete = () => resolve(r && r.result);
     tx.onerror = () => reject(tx.error);
   });
 }
 const putPhoto = (id, blob) => idb("readwrite", (s) => s.put(blob, id));
 const getPhoto = (id) => idb("readonly", (s) => s.get(id));
+// Photos waiting for analysis are saved until they're analyzed, so they survive app closes and dropped connections.
+const savePending = (job) =>
+  idb("readwrite", (s) => s.put({ id: job.id, dataUrl: job.dataUrl, takenAt: job.takenAt }, job.id), "pending").catch(() => {});
+const dropPending = (id) => idb("readwrite", (s) => s.delete(id), "pending").catch(() => {});
+async function resumePending() {
+  const saved = (await idb("readonly", (s) => s.getAll(), "pending").catch(() => [])) || [];
+  saved.sort((a, b) => a.takenAt - b.takenAt).forEach((j) => queue.push({ ...j, tries: 0 }));
+  if (saved.length) {
+    updateStatus();
+    pump();
+  }
+}
 async function prunePhotos() {
   const keep = new Set(items.map((i) => i.photoId).filter(Boolean));
   const keys = await idb("readonly", (s) => s.getAllKeys());
@@ -159,6 +174,7 @@ $("saveSettings").onclick = () => {
   settings.provider = $("provider").value;
   settings.apiKey = $("apiKey").value.trim();
   settings.model = $("model").value;
+  setTimeout(pump);
   settings.minProfit = Math.max(0, Number($("minProfit").value) || 0);
   settings.sensitivity = $("sensitivity").value;
   settings.vibrate = $("vibrate").checked;
@@ -264,8 +280,9 @@ function watchLoop() {
 
 function enqueue(dataUrl) {
   stats.photos++;
-  queue.push({ id: `p${Date.now()}`, dataUrl, takenAt: Date.now() });
-  while (queue.length > MAX_QUEUE) queue.shift();
+  const job = { id: `p${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, dataUrl, takenAt: Date.now(), tries: 0 };
+  queue.push(job);
+  if (dataUrl) savePending(job);
   pump();
   updateStatus();
 }
@@ -325,7 +342,9 @@ function sceneSignature(canvas) {
   for (let i = 0; i < 256; i++) sig[i] = (px[i * 4] + px[i * 4 + 1] + px[i * 4 + 2]) / 3;
   return sig;
 }
+let pumpTimer = null;
 function pump() {
+  if (settings.provider !== "demo" && !settings.apiKey) return;
   while (inFlight < MAX_IN_FLIGHT && queue.length && Date.now() >= pausedUntil) {
     const job = queue.pop();
     inFlight++;
@@ -335,22 +354,32 @@ function pump() {
       pump();
     });
   }
-  if (queue.length && Date.now() < pausedUntil) setTimeout(pump, pausedUntil - Date.now() + 50);
+  clearTimeout(pumpTimer);
+  if (queue.length && Date.now() < pausedUntil) pumpTimer = setTimeout(pump, pausedUntil - Date.now() + 50);
 }
+
+const isNetworkError = (e) =>
+  !navigator.onLine || (e instanceof TypeError && /fetch|network|load failed/i.test(e.message));
 
 async function analyzeJob(job) {
   try {
     const found = await analyze(job.dataUrl);
     stats.analyzed++;
     await handleResults(found, job);
+    dropPending(job.id);
   } catch (e) {
     console.error(e);
-    if (e.status === 429) {
-      pausedUntil = Date.now() + (e.retryAfterMs || 20000);
+    job.tries = (job.tries || 0) + 1;
+    const offline = isNetworkError(e);
+    const limited = e.status === 429 || e.daily;
+    if (job.dataUrl && (offline || limited || e.status >= 500 || job.tries < 5)) {
       queue.push(job);
-      while (queue.length > MAX_QUEUE) queue.shift();
+      const wait = limited ? e.retryAfterMs || 20000 : Math.min(60000, 2000 * 2 ** Math.min(job.tries, 5));
+      pausedUntil = Math.max(pausedUntil, Date.now() + wait);
+    } else {
+      dropPending(job.id);
     }
-    lastError = e.daily ? e.message : e.status === 429 ? "AI rate limit hit" : e.message;
+    lastError = offline ? "No connection" : e.daily ? e.message : e.status === 429 ? "AI rate limit hit" : e.message;
     lastErrorAt = Date.now();
   }
 }
@@ -734,16 +763,23 @@ function flash(text, ms = 6000) {
 function updateStatus() {
   if (Date.now() < noteUntil) return;
   const pending = inFlight + queue.length;
-  if (!scanning && pending) return setStatus(`Stopped · finishing ${pending} photo${pending > 1 ? "s" : ""}…`, true);
+  const wait = Math.ceil((pausedUntil - Date.now()) / 1000);
+  let waitText = "";
+  if (wait > 0 && queue.length) {
+    const label =
+      lastError === "No connection" ? "no connection" :
+      lastError === "Free daily AI limit used up" ? "free daily AI limit used up" :
+      lastError === "AI rate limit hit" ? "AI limit" : "AI error";
+    waitText = `${label}, retrying in ${wait > 120 ? Math.ceil(wait / 60) + "m" : wait + "s"}`;
+  }
+  if (!scanning && pending) {
+    return setStatus(`Finishing ${pending} saved photo${pending > 1 ? "s" : ""}…${waitText ? " · " + waitText : ""}`, true);
+  }
   if (!scanning) return setStatus(stream ? "Label mode · point at a tag, tap Snap Label" : "Idle", !!stream);
   const parts = [`${stats.photos} photos`];
   if (aiming) parts.push("hold steady to snap");
   if (pending) parts.push(`analyzing ${pending}`);
-  const wait = Math.ceil((pausedUntil - Date.now()) / 1000);
-  if (wait > 0) {
-    const label = lastError === "Free daily AI limit used up" ? "free daily AI limit used up" : "AI limit";
-    parts.push(`${label}, resuming in ${wait > 120 ? Math.ceil(wait / 60) + "m" : wait + "s"}`);
-  }
+  if (waitText) parts.push(waitText);
   else if (lastError && Date.now() - lastErrorAt < 8000) parts.push(`error: ${lastError}`);
   setStatus("Scanning · " + parts.join(" · "), true);
 }
@@ -942,6 +978,7 @@ $("clearBtn").onclick = () => {
 };
 
 document.addEventListener("visibilitychange", async () => {
+  if (document.visibilityState === "visible") pump();
   if (scanning && document.visibilityState === "visible") {
     try { wakeLock = await navigator.wakeLock?.request("screen"); } catch {}
   }
@@ -953,6 +990,12 @@ setInterval(() => {
 setInterval(updateStatus, 1000);
 
 if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+window.addEventListener("online", () => {
+  pausedUntil = 0;
+  pump();
+});
+navigator.storage?.persist?.().catch(() => {});
 recomputeDeals();
 updateBadge();
 render();
+resumePending();
