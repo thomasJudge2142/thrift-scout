@@ -61,8 +61,8 @@
       <label>Minimum profit for a deal ($)
         <input id="minProfit" type="number" min="0" step="1" />
       </label>
-      <label>Scan every (seconds)
-        <input id="interval" type="number" min="1" max="30" step="1" />
+      <label>Take a photo every (seconds)
+        <input id="interval" type="number" min="0.5" max="30" step="0.5" />
       </label>
       <label class="row"><input id="vibrate" type="checkbox" /> Vibrate + beep on deals</label>
       <div class="dialog-actions">
@@ -70,6 +70,20 @@
         <button id="saveSettings" value="save">Save</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog id="viewer">
+    <div class="viewer-photo">
+      <img id="viewerImg" alt="Photo where the item was spotted" />
+      <div id="viewerBox" class="viewer-box" hidden></div>
+    </div>
+    <div class="viewer-info">
+      <div id="viewerName" class="name"></div>
+      <div id="viewerMeta" class="meta"></div>
+      <div id="viewerPrices" class="prices"></div>
+      <a id="viewerLink" target="_blank" rel="noopener">Check eBay sold prices →</a>
+    </div>
+    <form method="dialog" class="dialog-actions"><button>Close</button></form>
   </dialog>
 
   <script src="app.js"></script>
