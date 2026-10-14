@@ -7,7 +7,8 @@ Every few seconds it sends a camera frame to an AI vision model (Google Gemini o
 ## Use it
 1. Open the hosted app on your phone and add it to your home screen.
 2. Tap the gear icon, choose **Google Gemini**, and paste your API key (get a free one at https://aistudio.google.com/apikey). The key is stored only on your device.
-3. Tap **Start Scanning** and pause a few seconds at each shelf.
+3. Tap **Start Scanning** and walk the aisles. Photos are analyzed in the background; tap any deal to see the photo it was spotted in.
+4. For clothing, tap **Label**, point the camera at the neck/care tag, and tap **Snap Label** to get brand, size, and resale estimate.
 
 Demo mode works without a key and shows fake results.
 

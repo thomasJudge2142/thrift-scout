@@ -45,6 +45,24 @@ For each item return:
 - why: one short sentence explaining the value
 Respond ONLY with JSON: {"items":[...]}. If nothing is worth noting, respond {"items":[]}.`;
 
+const LABEL_PROMPT = `You are an expert vintage and secondhand clothing reseller.
+This is a close-up photo of a clothing label (neck tag, waist tag, or care/content tag) taken in a thrift store, possibly with part of the garment visible.
+Read every word on the label: brand, sub-line, size, fiber content, country of manufacture, RN/CA number, union tag, style or lot number.
+Use those clues (and anything visible of the garment) to identify the most likely item, its era (e.g. "90s", "vintage 70s", "modern"), and realistic recent eBay SOLD prices for it.
+Return exactly one item, or none if no brand can be read:
+- name: brand + garment + key details, e.g. "Patagonia Synchilla fleece pullover, Men's L, Made in USA (90s)"
+- category: "clothing" (or "shoes"/"accessories")
+- condition: best guess or "unknown"
+- tag_price: USD if a thrift price tag/sticker is readable, else null
+- est_store_price: typical US thrift store price for this garment
+- resale_low and resale_high: realistic recent eBay SOLD price range in USD
+- confidence: 0 to 1
+- box_2d: [ymin, xmin, ymax, xmax] of the label in the photo, normalized to 0-1000
+- label_text: the exact text you read on the label
+- why: one short sentence on what makes it valuable or not (brand demand, era, origin, material)
+Respond ONLY with JSON: {"items":[...]}. If the label is unreadable or has no brand, respond {"items":[]}.`;
+const LABEL_SIDE = 1280;
+
 // ---------- Photo storage (IndexedDB) ----------
 const dbPromise = new Promise((resolve, reject) => {
   const req = indexedDB.open("thrift-scout", 1);
@@ -105,6 +123,7 @@ $("saveSettings").onclick = () => {
 
 // ---------- Camera ----------
 async function startCamera() {
+  if (stream) return;
   stream = await navigator.mediaDevices.getUserMedia({
     video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1440 } },
     audio: false,
@@ -145,6 +164,7 @@ async function start() {
 }
 function stop() {
   scanning = false;
+  $("labelBtn").textContent = "Label";
   clearTimeout(captureTimer);
   queue.length = 0;
   stopCamera();
@@ -175,16 +195,16 @@ function captureLoop() {
   captureTimer = setTimeout(captureLoop, settings.interval * 1000);
 }
 
-function captureFrame() {
+function captureFrame(side = SEND_SIDE, quality = 0.75) {
   const v = $("video");
   if (!stream || !v.videoWidth) return null;
-  const scale = Math.min(1, SEND_SIDE / Math.max(v.videoWidth, v.videoHeight));
+  const scale = Math.min(1, side / Math.max(v.videoWidth, v.videoHeight));
   const c = $("canvas");
   c.width = Math.round(v.videoWidth * scale);
   c.height = Math.round(v.videoHeight * scale);
   const ctx = c.getContext("2d", { willReadFrequently: true });
   ctx.drawImage(v, 0, 0, c.width, c.height);
-  return { dataUrl: c.toDataURL("image/jpeg", 0.75), signature: sceneSignature(c) };
+  return { dataUrl: c.toDataURL("image/jpeg", quality), signature: sceneSignature(c) };
 }
 
 function sceneSignature(canvas) {
@@ -235,23 +255,23 @@ async function analyzeJob(job) {
 }
 
 // ---------- AI providers ----------
-async function analyze(dataUrl) {
-  if (settings.provider === "demo") return demoAnalyze();
+async function analyze(dataUrl, prompt = PROMPT) {
+  if (settings.provider === "demo") return demoAnalyze(prompt === LABEL_PROMPT);
   if (!dataUrl) throw new Error("camera not ready");
-  const text = settings.provider === "gemini" ? await callGemini(dataUrl.split(",")[1]) : await callOpenAI(dataUrl);
+  const text = settings.provider === "gemini" ? await callGemini(dataUrl.split(",")[1], prompt) : await callOpenAI(dataUrl, prompt);
   return parseItems(text);
 }
 
 const geminiOutOfQuota = new Map();
 
-async function callGemini(b64) {
+async function callGemini(b64, prompt) {
   const chain = settings.model ? [settings.model] : GEMINI_FALLBACKS;
   let lastErr;
   for (let n = 0; n < chain.length; n++) {
     const idx = (geminiFallbackIdx + n) % chain.length;
     if ((geminiOutOfQuota.get(chain[idx]) || 0) > Date.now()) continue;
     try {
-      const text = await callGeminiModel(chain[idx], b64);
+      const text = await callGeminiModel(chain[idx], b64, prompt);
       geminiFallbackIdx = idx;
       return text;
     } catch (e) {
@@ -274,7 +294,7 @@ async function callGemini(b64) {
   throw lastErr;
 }
 
-async function callGeminiModel(model, b64) {
+async function callGeminiModel(model, b64, prompt) {
   const generationConfig = { responseMimeType: "application/json", temperature: 0.2 };
   if (!geminiNoThinking.has(model)) generationConfig.thinkingConfig = { thinkingLevel: "low" };
   const res = await fetch(
@@ -283,7 +303,7 @@ async function callGeminiModel(model, b64) {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-goog-api-key": settings.apiKey },
       body: JSON.stringify({
-        contents: [{ parts: [{ text: PROMPT }, { inline_data: { mime_type: "image/jpeg", data: b64 } }] }],
+        contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: "image/jpeg", data: b64 } }] }],
         generationConfig,
       }),
     }
@@ -293,7 +313,7 @@ async function callGeminiModel(model, b64) {
     const msg = data.error?.message || "";
     if (res.status === 400 && /thinking/i.test(msg) && !geminiNoThinking.has(model)) {
       geminiNoThinking.add(model);
-      return callGeminiModel(model, b64);
+      return callGeminiModel(model, b64, prompt);
     }
     const err = httpError(res, msg);
     const retry = data.error?.details?.find((d) => d.retryDelay)?.retryDelay;
@@ -305,7 +325,7 @@ async function callGeminiModel(model, b64) {
   return data.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || "";
 }
 
-async function callOpenAI(dataUrl) {
+async function callOpenAI(dataUrl, prompt) {
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${settings.apiKey}` },
@@ -317,7 +337,7 @@ async function callOpenAI(dataUrl) {
         {
           role: "user",
           content: [
-            { type: "text", text: PROMPT },
+            { type: "text", text: prompt },
             { type: "image_url", image_url: { url: dataUrl, detail: "high" } },
           ],
         },
@@ -359,8 +379,12 @@ const DEMO_ITEMS = [
   { name: "Le Creuset enameled Dutch oven", category: "kitchenware", condition: "good", tag_price: 24.99, est_store_price: 25, resale_low: 120, resale_high: 200, confidence: 0.7, why: "Premium cookware, holds value." },
   { name: "Levi's 501 jeans (Made in USA)", category: "clothing", condition: "good", tag_price: 6.99, est_store_price: 7, resale_low: 40, resale_high: 90, confidence: 0.65, why: "Vintage USA-made 501s are sought after." },
 ];
-async function demoAnalyze() {
+async function demoAnalyze(label = false) {
   await new Promise((r) => setTimeout(r, 600));
+  if (label) {
+    const clothes = DEMO_ITEMS.filter((i) => i.category === "clothing");
+    return [{ ...clothes[Math.floor(Math.random() * clothes.length)], box_2d: [300, 250, 700, 750], label_text: "(demo label)" }];
+  }
   const n = Math.floor(Math.random() * 3);
   return Array.from({ length: n }, () => {
     const y = Math.floor(Math.random() * 600), x = Math.floor(Math.random() * 600);
@@ -392,6 +416,7 @@ function evaluate(raw) {
     category: String(raw.category || "").slice(0, 40),
     condition: String(raw.condition || "").slice(0, 40),
     why: String(raw.why || "").slice(0, 200),
+    labelText: raw.label_text ? String(raw.label_text).slice(0, 200) : "",
     tagPrice: tag,
     cost,
     priceIsEstimate: tag == null,
@@ -439,7 +464,7 @@ function cropThumb(img, box) {
 }
 
 async function handleResults(found, job) {
-  if (!found.length) return;
+  if (!found.length) return [];
   const img = job.dataUrl ? await loadImage(job.dataUrl).catch(() => null) : null;
   let photoSaved = false;
   const savePhoto = async () => {
@@ -448,6 +473,7 @@ async function handleResults(found, job) {
     await putPhoto(job.id, await (await fetch(job.dataUrl)).blob()).catch(() => {});
   };
   const newDeals = [];
+  const touched = [];
   for (const raw of found) {
     const ev = evaluate(raw);
     const key = keyOf(ev.name);
@@ -467,14 +493,67 @@ async function handleResults(found, job) {
       items.unshift(it);
       if (it.deal) newDeals.push(it);
     }
+    if (job.label) it.fromLabel = true;
+    touched.push(it);
     if (it.photoId) await savePhoto();
   }
   items = items.slice(0, MAX_PHOTOS);
-  if (newDeals.length) alertDeal(newDeals[0]);
+  if (newDeals.length && !job.label) alertDeal(newDeals[0]);
   persist();
   render();
   prunePhotos().catch(() => {});
+  return touched;
 }
+
+// ---------- Label snap ----------
+let snapping = false;
+async function snapLabel() {
+  if (snapping) return;
+  if (settings.provider !== "demo" && !settings.apiKey) {
+    alert("Add your API key in Settings (gear icon), or switch to Demo mode.");
+    return;
+  }
+  const btn = $("labelBtn");
+  if (!stream) {
+    try {
+      await startCamera();
+    } catch (e) {
+      if (settings.provider !== "demo") return setStatus("Camera blocked: " + e.message);
+    }
+    unlockAudio();
+    if (!scanning) {
+      btn.textContent = "Snap Label";
+      flash("Point at the clothing label so it fills the screen, then tap Snap Label");
+      return;
+    }
+  }
+  snapping = true;
+  btn.disabled = true;
+  btn.textContent = "Reading label…";
+  const frame = captureFrame(LABEL_SIDE, 0.85);
+  const job = { id: `p${Date.now()}`, dataUrl: frame?.dataUrl || null, takenAt: Date.now(), label: true };
+  try {
+    const found = (await analyze(job.dataUrl, LABEL_PROMPT)).slice(0, 1);
+    const [it] = await handleResults(found, job);
+    if (it) {
+      if (it.deal && settings.vibrate) {
+        navigator.vibrate?.([120, 60, 120]);
+        beep();
+      }
+      openViewer(it);
+    } else {
+      flash("Couldn't read a brand. Get closer so the label fills the screen.");
+    }
+  } catch (e) {
+    console.error(e);
+    flash("Label read failed: " + (e.message || "error"), 8000);
+  } finally {
+    snapping = false;
+    btn.disabled = false;
+    btn.textContent = "Snap Label";
+  }
+}
+$("labelBtn").onclick = snapLabel;
 
 function persist() {
   try {
@@ -532,8 +611,14 @@ function setStatus(text, live) {
   $("status").textContent = text;
   $("status").classList.toggle("scanning", !!live);
 }
+let noteUntil = 0;
+function flash(text, ms = 6000) {
+  noteUntil = Date.now() + ms;
+  setStatus(text, true);
+}
 function updateStatus() {
-  if (!scanning) return setStatus("Idle");
+  if (Date.now() < noteUntil) return;
+  if (!scanning) return setStatus(stream ? "Label mode · point at a tag, tap Snap Label" : "Idle", !!stream);
   const parts = [`${stats.photos} photos`];
   if (inFlight || queue.length) parts.push(`analyzing ${inFlight + queue.length}`);
   const wait = Math.ceil((pausedUntil - Date.now()) / 1000);
@@ -608,7 +693,7 @@ async function openViewer(it) {
     box.hidden = true;
   }
   $("viewerName").textContent = it.name;
-  $("viewerMeta").textContent = `Seen ${ago(it.seenAt)} · ${it.why}`;
+  $("viewerMeta").textContent = `Seen ${ago(it.seenAt)} · ${it.why}` + (it.labelText ? ` · Label: "${it.labelText}"` : "");
   $("viewerPrices").innerHTML = pricesHtml(it) + `<span class="profit${it.profit < 0 ? " neg" : ""}">Profit: ${money(it.profit)}</span>`;
   $("viewerLink").href = ebayUrl(it);
   $("viewer").showModal();
