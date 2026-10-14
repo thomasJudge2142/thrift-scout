@@ -61,3 +61,19 @@ dialog input:not([type=checkbox]), dialog select { display:block; width:100%; ma
 .viewer-info .prices { display:flex; flex-wrap:wrap; gap:.4rem .9rem; font-size:.9rem; margin-bottom:.5rem; }
 .viewer-info .profit { color:var(--green); font-weight:700; }
 #viewer::backdrop { background:rgba(0,0,0,.7); }
+.haul-status { font-size:.8rem; font-weight:600; color:var(--accent); margin-top:.2rem; }
+.haul-status.sold { color:var(--green); }
+.viewer-actions { display:flex; gap:.5rem; margin:.5rem 0 .6rem; flex-wrap:wrap; }
+.viewer-actions button { padding:.55rem 1rem; border:none; border-radius:.5rem; background:var(--green); color:#052e16; font-weight:700; cursor:pointer; }
+.viewer-actions button.secondary { background:#334155; color:var(--text); }
+.haul-summary { display:grid; grid-template-columns:repeat(3,1fr); gap:.5rem; margin:.6rem 0; }
+.haul-summary div { background:var(--card); border-radius:.6rem; padding:.6rem; text-align:center; }
+.haul-summary b { display:block; font-size:1.15rem; }
+.haul-summary b.pos { color:var(--green); }
+.haul-summary b.neg { color:var(--red); }
+.haul-summary span { font-size:.7rem; color:var(--muted); }
+.items .trip { list-style:none; font-size:.8rem; font-weight:700; color:var(--muted); padding:.6rem .2rem .2rem; cursor:default; }
+fieldset.cats { border:1px solid #334155; border-radius:.5rem; padding:.5rem .7rem; margin:.6rem 0; }
+fieldset.cats legend { font-size:.8rem; color:var(--muted); padding:0 .3rem; }
+#catList { display:grid; grid-template-columns:repeat(2,1fr); gap:.3rem .6rem; }
+#catList .cat { display:flex; align-items:center; gap:.3rem; font-size:.9rem; margin:0; }

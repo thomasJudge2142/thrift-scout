@@ -36,9 +36,14 @@
     <div class="tabs">
       <button class="tab active" data-tab="deals">Deals <span id="dealCount">0</span></button>
       <button class="tab" data-tab="seen">All items <span id="seenCount">0</span></button>
+      <button class="tab" data-tab="haul">Haul <span id="haulCount">0</span></button>
     </div>
     <ul id="dealsList" class="items"></ul>
     <ul id="seenList" class="items" hidden></ul>
+    <div id="haulView" hidden>
+      <div id="haulSummary" class="haul-summary"></div>
+      <ul id="haulList" class="items"></ul>
+    </div>
     <p id="emptyMsg" class="empty">No deals yet. Start scanning!</p>
     <button id="clearBtn" class="link-btn">Clear list</button>
   </section>
@@ -66,6 +71,10 @@
         <input id="interval" type="number" min="0.5" max="30" step="0.5" />
       </label>
       <label class="row"><input id="vibrate" type="checkbox" /> Vibrate + beep on deals</label>
+      <fieldset class="cats">
+        <legend>Only look for (leave all unchecked for everything)</legend>
+        <div id="catList"></div>
+      </fieldset>
       <div class="dialog-actions">
         <button value="cancel" class="secondary">Cancel</button>
         <button id="saveSettings" value="save">Save</button>
@@ -82,6 +91,8 @@
       <div id="viewerName" class="name"></div>
       <div id="viewerMeta" class="meta"></div>
       <div id="viewerPrices" class="prices"></div>
+      <div id="viewerStatus" class="haul-status" hidden></div>
+      <div id="viewerActions" class="viewer-actions"></div>
       <a id="viewerLink" target="_blank" rel="noopener">Check eBay sold prices →</a>
     </div>
     <form method="dialog" class="dialog-actions"><button>Close</button></form>

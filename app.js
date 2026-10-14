@@ -12,7 +12,7 @@ const SEND_SIDE = 800;
 const SAME_SCENE_DIFF = 6;
 
 const settings = Object.assign(
-  { provider: "demo", apiKey: "", model: "", minProfit: 15, interval: 1.5, vibrate: true },
+  { provider: "demo", apiKey: "", model: "", minProfit: 15, interval: 1.5, vibrate: true, categories: [] },
   JSON.parse(localStorage.getItem("ts-settings") || "{}")
 );
 let items = JSON.parse(localStorage.getItem("ts-items") || "[]");
@@ -31,11 +31,12 @@ const queue = [];
 let inFlight = 0;
 const stats = { photos: 0, skipped: 0, analyzed: 0 };
 
+const CATEGORIES = ["clothing", "shoes", "accessories", "electronics", "kitchenware", "decor", "books", "media", "toys", "tools", "sports", "collectibles", "furniture"];
 const PROMPT = `You are an expert thrift store reseller helping someone find items to flip.
 This photo was taken while walking through a thrift store. Identify distinct items that are clearly visible and specific enough to price (brand, model, maker, or a notable style). Skip generic, unbranded, or unrecognizable items.
 For each item return:
 - name: specific name, e.g. "Pyrex Butterprint mixing bowl" or "Patagonia Better Sweater fleece"
-- category: e.g. clothing, electronics, kitchenware, books, toys, decor, tools
+- category: one of ${CATEGORIES.join(", ")} (media = video games, DVDs, vinyl, CDs)
 - condition: your best guess from the photo (e.g. "good", "worn", "like new", "unknown")
 - tag_price: price in USD if you can read a price tag/sticker for this item, else null
 - est_store_price: what a typical US thrift store would charge for it if there is no readable tag
@@ -106,6 +107,18 @@ $("settingsBtn").onclick = () => {
   $("minProfit").value = settings.minProfit;
   $("interval").value = settings.interval;
   $("vibrate").checked = settings.vibrate;
+  $("catList").replaceChildren(
+    ...CATEGORIES.map((c) => {
+      const l = document.createElement("label");
+      l.className = "cat";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.value = c;
+      cb.checked = (settings.categories || []).includes(c);
+      l.append(cb, " " + c);
+      return l;
+    })
+  );
   $("settings").showModal();
 };
 $("provider").onchange = () => ($("model").placeholder = DEFAULT_MODELS[$("provider").value] || "auto");
@@ -116,6 +129,7 @@ $("saveSettings").onclick = () => {
   settings.minProfit = Math.max(0, Number($("minProfit").value) || 0);
   settings.interval = Math.min(30, Math.max(0.5, Number($("interval").value) || 1.5));
   settings.vibrate = $("vibrate").checked;
+  settings.categories = [...$("catList").querySelectorAll("input:checked")].map((cb) => cb.value);
   saveSettings();
   recomputeDeals();
   render();
@@ -255,7 +269,20 @@ async function analyzeJob(job) {
 }
 
 // ---------- AI providers ----------
-async function analyze(dataUrl, prompt = PROMPT) {
+function scanPrompt() {
+  const c = settings.categories || [];
+  return c.length ? PROMPT + `\nONLY report items in these categories: ${c.join(", ")}. Ignore everything else.` : PROMPT;
+}
+function normCategory(cat) {
+  const k = String(cat || "").toLowerCase();
+  return CATEGORIES.find((x) => k.includes(x) || x.includes(k)) || k;
+}
+function categoryAllowed(it) {
+  const c = settings.categories || [];
+  return !c.length || it.fromLabel || !!it.status || c.includes(normCategory(it.category));
+}
+
+async function analyze(dataUrl, prompt = scanPrompt()) {
   if (settings.provider === "demo") return demoAnalyze(prompt === LABEL_PROMPT);
   if (!dataUrl) throw new Error("camera not ready");
   const text = settings.provider === "gemini" ? await callGemini(dataUrl.split(",")[1], prompt) : await callOpenAI(dataUrl, prompt);
@@ -428,7 +455,7 @@ function evaluate(raw) {
   };
 }
 function isDeal(it) {
-  return it.profit >= settings.minProfit && it.confidence >= MIN_CONFIDENCE;
+  return it.profit >= settings.minProfit && it.confidence >= MIN_CONFIDENCE && categoryAllowed(it);
 }
 function recomputeDeals() {
   items.forEach((it) => (it.deal = isDeal(it)));
@@ -486,7 +513,7 @@ async function handleResults(found, job) {
       if (better) Object.assign(it, ev);
       Object.assign(it, sighting);
       it.deal = isDeal(it);
-      if (it.deal && !wasDeal) newDeals.push(it);
+      if (it.deal && !wasDeal && !it.status) newDeals.push(it);
     } else {
       it = { ...ev, key, ...sighting };
       it.deal = isDeal(it);
@@ -497,7 +524,8 @@ async function handleResults(found, job) {
     touched.push(it);
     if (it.photoId) await savePhoto();
   }
-  items = items.slice(0, MAX_PHOTOS);
+  let kept = 0;
+  items = items.filter((i) => i.status || kept++ < MAX_PHOTOS);
   if (newDeals.length && !job.label) alertDeal(newDeals[0]);
   persist();
   render();
@@ -672,7 +700,14 @@ function itemEl(it) {
   link.target = "_blank";
   link.rel = "noopener";
   link.textContent = "Check eBay sold prices →";
-  info.append(name, meta, prices, seen, why, link);
+  info.append(name, meta, prices);
+  if (it.status) {
+    const st = document.createElement("div");
+    st.className = "haul-status " + it.status;
+    st.textContent = statusText(it);
+    info.append(st);
+  }
+  info.append(seen, why, link);
   li.appendChild(info);
   return li;
 }
@@ -696,21 +731,110 @@ async function openViewer(it) {
   $("viewerMeta").textContent = `Seen ${ago(it.seenAt)} · ${it.why}` + (it.labelText ? ` · Label: "${it.labelText}"` : "");
   $("viewerPrices").innerHTML = pricesHtml(it) + `<span class="profit${it.profit < 0 ? " neg" : ""}">Profit: ${money(it.profit)}</span>`;
   $("viewerLink").href = ebayUrl(it);
-  $("viewer").showModal();
+  renderViewerActions(it);
+  if (!$("viewer").open) $("viewer").showModal();
+}
+
+// ---------- Haul tracker ----------
+const realProfit = (it) => Math.round(((it.soldFor ?? 0) * (1 - FEE_RATE) - (it.paid ?? 0)) * 100) / 100;
+function statusText(it) {
+  if (it.status === "sold") return `Sold for ${money(it.soldFor)} · paid ${money(it.paid)} · real profit ${money(realProfit(it))}`;
+  if (it.status === "bought") return `Bought for ${money(it.paid)} · not sold yet`;
+  return "";
+}
+function askPrice(question, fallback) {
+  const v = prompt(question, fallback != null ? String(fallback) : "");
+  if (v == null) return null;
+  const n = parseFloat(String(v).replace(/[^0-9.]/g, ""));
+  return isFinite(n) && n >= 0 ? Math.round(n * 100) / 100 : null;
+}
+function setHaul(it, change) {
+  Object.assign(it, change);
+  it.deal = isDeal(it);
+  persist();
+  render();
+  openViewer(it);
+}
+function renderViewerActions(it) {
+  const box = $("viewerActions");
+  const btn = (label, fn, cls = "") => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = cls;
+    b.textContent = label;
+    b.onclick = fn;
+    return b;
+  };
+  const buttons = [];
+  if (!it.status) {
+    buttons.push(btn("I bought it", () => {
+      const paid = askPrice("How much did you pay?", it.cost);
+      if (paid != null) setHaul(it, { status: "bought", paid, boughtAt: Date.now() });
+    }));
+  } else if (it.status === "bought") {
+    buttons.push(btn("Mark sold", () => {
+      const soldFor = askPrice("What did it sell for (before fees)?", Math.round((it.low + it.high) / 2));
+      if (soldFor != null) setHaul(it, { status: "sold", soldFor, soldAt: Date.now() });
+    }));
+    buttons.push(btn("Not bought", () => setHaul(it, { status: undefined, paid: undefined, boughtAt: undefined }), "secondary"));
+  } else {
+    buttons.push(btn("Undo sale", () => setHaul(it, { status: "bought", soldFor: undefined, soldAt: undefined }), "secondary"));
+  }
+  box.replaceChildren(...buttons);
+  $("viewerStatus").textContent = statusText(it);
+  $("viewerStatus").hidden = !it.status;
+}
+
+function renderHaul(haul) {
+  const sold = haul.filter((i) => i.status === "sold");
+  const unsold = haul.filter((i) => i.status === "bought");
+  const spent = haul.reduce((a, i) => a + (i.paid || 0), 0);
+  const earned = sold.reduce((a, i) => a + realProfit(i), 0);
+  const potential = unsold.reduce((a, i) => a + i.profit + i.cost - (i.paid || 0), 0);
+  $("haulSummary").innerHTML =
+    `<div><b>${money(spent)}</b><span>spent</span></div>` +
+    `<div><b class="${earned < 0 ? "neg" : "pos"}">${money(earned)}</b><span>real profit (${sold.length} sold)</span></div>` +
+    `<div><b>${money(potential)}</b><span>est. profit left (${unsold.length} unsold)</span></div>`;
+  const trips = new Map();
+  [...haul].sort((a, b) => (b.boughtAt || 0) - (a.boughtAt || 0)).forEach((i) => {
+    const day = new Date(i.boughtAt || Date.now()).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" });
+    if (!trips.has(day)) trips.set(day, []);
+    trips.get(day).push(i);
+  });
+  const els = [];
+  for (const [day, list] of trips) {
+    const head = document.createElement("li");
+    head.className = "trip";
+    const tSpent = list.reduce((a, i) => a + (i.paid || 0), 0);
+    const tProfit = list.filter((i) => i.status === "sold").reduce((a, i) => a + realProfit(i), 0);
+    head.textContent = `${day} · ${list.length} item${list.length === 1 ? "" : "s"} · spent ${money(tSpent)} · profit so far ${money(tProfit)}`;
+    els.push(head, ...list.map(itemEl));
+  }
+  $("haulList").replaceChildren(...els);
 }
 
 function render() {
-  const deals = items.filter((i) => i.deal).sort((a, b) => b.profit - a.profit);
+  const visible = items.filter(categoryAllowed);
+  const deals = visible.filter((i) => i.deal && !i.status).sort((a, b) => b.profit - a.profit);
+  const haul = items.filter((i) => i.status);
   $("dealCount").textContent = deals.length;
-  $("seenCount").textContent = items.length;
+  $("seenCount").textContent = visible.length;
+  $("haulCount").textContent = haul.length;
   $("dealsList").replaceChildren(...deals.map(itemEl));
-  $("seenList").replaceChildren(...items.map(itemEl));
+  $("seenList").replaceChildren(...visible.map(itemEl));
+  renderHaul(haul);
   $("dealsList").hidden = activeTab !== "deals";
   $("seenList").hidden = activeTab !== "seen";
-  const shown = activeTab === "deals" ? deals.length : items.length;
+  $("haulView").hidden = activeTab !== "haul";
+  const shown = { deals: deals.length, seen: visible.length, haul: haul.length }[activeTab];
   $("emptyMsg").hidden = shown > 0;
-  $("emptyMsg").textContent = activeTab === "deals" ? "No deals yet. Start scanning!" : "Nothing seen yet.";
-  $("clearBtn").hidden = items.length === 0;
+  $("emptyMsg").textContent = {
+    deals: "No deals yet. Start scanning!",
+    seen: "Nothing seen yet.",
+    haul: "Nothing in your haul yet. Tap a find, then \"I bought it\".",
+  }[activeTab];
+  $("haulSummary").hidden = haul.length === 0;
+  $("clearBtn").hidden = activeTab === "haul" || !items.some((i) => !i.status);
 }
 document.querySelectorAll(".tab").forEach((b) => {
   b.onclick = () => {
@@ -720,8 +844,8 @@ document.querySelectorAll(".tab").forEach((b) => {
   };
 });
 $("clearBtn").onclick = () => {
-  if (!confirm("Clear all scanned items?")) return;
-  items = [];
+  if (!confirm("Clear scanned items? Your haul is kept.")) return;
+  items = items.filter((i) => i.status);
   persist();
   render();
   prunePhotos().catch(() => {});
