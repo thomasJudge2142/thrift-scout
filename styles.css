@@ -33,6 +33,9 @@ header h1 { font-size:1.2rem; margin:0; flex:1; }
 .item .info { flex:1; min-width:0; }
 .item .name { font-weight:700; margin-bottom:.15rem; }
 .item .meta { font-size:.8rem; color:var(--muted); }
+.pipeline-status { font-size:.8rem; color:var(--accent); margin-top:.35rem; }
+.pipeline-status.retrying { color:var(--muted); }
+.pipeline-status.failed { color:#f87171; }
 .item .prices { display:flex; gap:.8rem; font-size:.85rem; margin-top:.3rem; flex-wrap:wrap; }
 .profit { color:var(--green); font-weight:700; }
 .profit.neg { color:var(--red); }

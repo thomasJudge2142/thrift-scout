@@ -1,0 +1,9 @@
+.assetsignore
+.git/
+.wrangler/
+.dev.vars
+README.md
+wrangler.toml
+worker.mjs
+worker.test.mjs
+node_modules/

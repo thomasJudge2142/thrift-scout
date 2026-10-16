@@ -1,29 +1,6 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
-const DEFAULT_MODELS = { gemini: "gemini-flash-lite-latest", openai: "gpt-4o-mini", demo: "" };
-const MODEL_CHOICES = {
-  gemini: [
-    ["", "Auto (recommended): fastest, switches when a limit is hit"],
-    ["gemini-flash-lite-latest", "Flash Lite: fastest (~1s per photo)"],
-    ["gemini-3.8-flash", "3.8 Flash: smarter, slower (~4s)"],
-    ["gemini-flash-latest", "Flash (latest)"],
-    ["gemini-3.5-flash", "3.5 Flash"],
-  ],
-  openai: [
-    ["", "Auto (recommended): GPT-4o mini"],
-    ["gpt-4o-mini", "GPT-4o mini: fast, cheap"],
-    ["gpt-4o", "GPT-4o: more accurate, pricier"],
-  ],
-  demo: [["", "No model needed in demo mode"]],
-};
-function fillModels(provider, selected = "") {
-  const choices = [...(MODEL_CHOICES[provider] || MODEL_CHOICES.demo)];
-  if (selected && !choices.some(([v]) => v === selected)) choices.push([selected, selected]);
-  $("model").replaceChildren(...choices.map(([v, label]) => new Option(label, v, false, v === selected)));
-  $("model").disabled = provider === "demo";
-}
-const GEMINI_FALLBACKS = ["gemini-flash-lite-latest", "gemini-3.8-flash", "gemini-flash-latest", "gemini-3.5-flash"];
 const FEE_RATE = 0.15;
 const MIN_CONFIDENCE = 0.5;
 const MAX_IN_FLIGHT = 2;
@@ -38,13 +15,22 @@ const SENSITIVITY = {
   high: { steadyMs: 400, still: 8, newScene: 4 },
 };
 
+const storedSettings = JSON.parse(localStorage.getItem("ts-settings") || "{}");
+if ("apiKey" in storedSettings || "model" in storedSettings || storedSettings.provider === "openai") {
+  delete storedSettings.apiKey;
+  delete storedSettings.model;
+  if (storedSettings.provider === "openai") storedSettings.provider = "gemini";
+  localStorage.setItem("ts-settings", JSON.stringify(storedSettings));
+}
 const settings = Object.assign(
-  { provider: "demo", apiKey: "", model: "", minProfit: 15, sensitivity: "normal", vibrate: true, categories: [] },
-  JSON.parse(localStorage.getItem("ts-settings") || "{}")
+  { provider: "demo", minProfit: 15, sensitivity: "normal", vibrate: true, categories: [] },
+  storedSettings
 );
+if (!["demo", "gemini"].includes(settings.provider)) settings.provider = "demo";
 let items = JSON.parse(localStorage.getItem("ts-items") || "[]");
 
 let stream = null;
+let cameraStartPromise = null;
 let scanning = false;
 let watchTimer = null;
 let prevSig = null;
@@ -57,44 +43,12 @@ let wakeLock = null;
 let pausedUntil = 0;
 let audioCtx = null;
 let activeTab = "deals";
-let geminiFallbackIdx = 0;
-let geminiNoThinking = new Set();
 let lastSignature = null;
 const queue = [];
 let inFlight = 0;
 const stats = { photos: 0, skipped: 0, analyzed: 0 };
 
 const CATEGORIES = ["clothing", "shoes", "accessories", "electronics", "kitchenware", "decor", "books", "media", "toys", "tools", "sports", "collectibles", "furniture"];
-const PROMPT = `You are an expert thrift store reseller helping someone find items to flip.
-This photo was taken while walking through a thrift store. Identify distinct items that are clearly visible and specific enough to price (brand, model, maker, or a notable style). Skip generic, unbranded, or unrecognizable items.
-For each item return:
-- name: specific name, e.g. "Pyrex Butterprint mixing bowl" or "Patagonia Better Sweater fleece"
-- category: one of ${CATEGORIES.join(", ")} (media = video games, DVDs, vinyl, CDs)
-- condition: your best guess from the photo (e.g. "good", "worn", "like new", "unknown")
-- tag_price: price in USD if you can read a price tag/sticker for this item, else null
-- est_store_price: what a typical US thrift store would charge for it if there is no readable tag
-- resale_low and resale_high: realistic recent eBay SOLD price range in USD
-- confidence: 0 to 1, how sure you are of the identification and pricing
-- box_2d: [ymin, xmin, ymax, xmax] bounding box of the item in the photo, normalized to 0-1000
-- why: one short sentence explaining the value
-Respond ONLY with JSON: {"items":[...]}. If nothing is worth noting, respond {"items":[]}.`;
-
-const LABEL_PROMPT = `You are an expert vintage and secondhand clothing reseller.
-This is a close-up photo of a clothing label (neck tag, waist tag, or care/content tag) taken in a thrift store, possibly with part of the garment visible.
-Read every word on the label: brand, sub-line, size, fiber content, country of manufacture, RN/CA number, union tag, style or lot number.
-Use those clues (and anything visible of the garment) to identify the most likely item, its era (e.g. "90s", "vintage 70s", "modern"), and realistic recent eBay SOLD prices for it.
-Return exactly one item, or none if no brand can be read:
-- name: brand + garment + key details, e.g. "Patagonia Synchilla fleece pullover, Men's L, Made in USA (90s)"
-- category: "clothing" (or "shoes"/"accessories")
-- condition: best guess or "unknown"
-- tag_price: USD if a thrift price tag/sticker is readable, else null
-- est_store_price: typical US thrift store price for this garment
-- resale_low and resale_high: realistic recent eBay SOLD price range in USD
-- confidence: 0 to 1
-- box_2d: [ymin, xmin, ymax, xmax] of the label in the photo, normalized to 0-1000
-- label_text: the exact text you read on the label
-- why: one short sentence on what makes it valuable or not (brand demand, era, origin, material)
-Respond ONLY with JSON: {"items":[...]}. If the label is unreadable or has no brand, respond {"items":[]}.`;
 const LABEL_SIDE = 1280;
 
 // ---------- Photo storage (IndexedDB) ----------
@@ -121,15 +75,61 @@ const putPhoto = (id, blob) => idb("readwrite", (s) => s.put(blob, id));
 const getPhoto = (id) => idb("readonly", (s) => s.get(id));
 // Photos waiting for analysis are saved until they're analyzed, so they survive app closes and dropped connections.
 const savePending = (job) =>
-  idb("readwrite", (s) => s.put({ id: job.id, dataUrl: job.dataUrl, takenAt: job.takenAt }, job.id), "pending").catch(() => {});
+  idb("readwrite", (s) => s.put({ id: job.id, dataUrl: job.dataUrl, takenAt: job.takenAt, manual: job.manual, label: job.label }, job.id), "pending");
 const dropPending = (id) => idb("readwrite", (s) => s.delete(id), "pending").catch(() => {});
 async function resumePending() {
   const saved = (await idb("readonly", (s) => s.getAll(), "pending").catch(() => [])) || [];
-  saved.sort((a, b) => a.takenAt - b.takenAt).forEach((j) => queue.push({ ...j, tries: 0 }));
+  saved.sort((a, b) => a.takenAt - b.takenAt).forEach((j) => {
+    const job = { ...j, tries: 0, ready: true };
+    queue.push(job);
+    queue.sort((a, b) => a.takenAt - b.takenAt);
+    if (!items.some((item) => item.key === pendingItemKey(job.id))) items.unshift(makePendingItem(job));
+  });
   if (saved.length) {
+    persist();
+    render();
     updateStatus();
     pump();
   }
+}
+
+const pendingItemKey = (id) => `pending-${id}`;
+function makePendingItem(job) {
+  return {
+    key: pendingItemKey(job.id),
+    name: "Analyzing captured item…",
+    category: "pending",
+    condition: "unknown",
+    why: "Waiting for Google visual search and Gemini price research.",
+    confidence: 0,
+    cost: 0,
+    low: 0,
+    high: 0,
+    profit: null,
+    priceKnown: false,
+    priceIsEstimate: true,
+    seenAt: job.takenAt,
+    photoId: job.dataUrl ? job.id : null,
+    fromLabel: !!job.label,
+    pipelineState: "queued",
+  };
+}
+
+function setPipelineState(job, state, message = "") {
+  const item = items.find((entry) => entry.key === pendingItemKey(job.id));
+  if (!item) return;
+  item.pipelineState = state;
+  if (state === "failed") {
+    item.name = "Could not analyze captured photo";
+    item.why = message || "Analysis failed. You can retry from this item's details.";
+    item.lookupError = message || "Analysis failed. You can retry from this item's details.";
+  } else {
+    item.name = state === "retrying" ? "Retrying item research…" : "Identifying and pricing item…";
+    item.why = message || "Google visual search and Gemini price research are running.";
+    item.lookupError = "";
+  }
+  persist();
+  render();
 }
 async function prunePhotos() {
   const keep = new Set(items.map((i) => i.photoId).filter(Boolean));
@@ -144,14 +144,12 @@ function saveSettings() {
   updateBadge();
 }
 function updateBadge() {
-  const live = settings.provider !== "demo" && settings.apiKey;
-  $("modeBadge").textContent = live ? settings.provider : "Demo";
+  const live = settings.provider !== "demo";
+  $("modeBadge").textContent = live ? "Live AI" : "Demo";
   $("modeBadge").classList.toggle("live", !!live);
 }
 $("settingsBtn").onclick = () => {
   $("provider").value = settings.provider;
-  $("apiKey").value = settings.apiKey;
-  fillModels(settings.provider, settings.model);
   $("minProfit").value = settings.minProfit;
   $("sensitivity").value = settings.sensitivity in SENSITIVITY ? settings.sensitivity : "normal";
   $("vibrate").checked = settings.vibrate;
@@ -169,11 +167,8 @@ $("settingsBtn").onclick = () => {
   );
   $("settings").showModal();
 };
-$("provider").onchange = () => fillModels($("provider").value);
 $("saveSettings").onclick = () => {
   settings.provider = $("provider").value;
-  settings.apiKey = $("apiKey").value.trim();
-  settings.model = $("model").value;
   setTimeout(pump);
   settings.minProfit = Math.max(0, Number($("minProfit").value) || 0);
   settings.sensitivity = $("sensitivity").value;
@@ -187,13 +182,28 @@ $("saveSettings").onclick = () => {
 // ---------- Camera ----------
 async function startCamera() {
   if (stream) return;
-  stream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1440 } },
-    audio: false,
-  });
-  $("video").srcObject = stream;
-  await $("video").play();
-  $("cameraPlaceholder").hidden = true;
+  if (cameraStartPromise) return cameraStartPromise;
+  cameraStartPromise = (async () => {
+    const nextStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1440 } },
+      audio: false,
+    });
+    $("video").srcObject = nextStream;
+    try {
+      await $("video").play();
+      stream = nextStream;
+      $("cameraPlaceholder").hidden = true;
+    } catch (error) {
+      nextStream.getTracks().forEach((track) => track.stop());
+      $("video").srcObject = null;
+      throw error;
+    }
+  })();
+  try {
+    await cameraStartPromise;
+  } finally {
+    cameraStartPromise = null;
+  }
 }
 function stopCamera() {
   if (stream) stream.getTracks().forEach((t) => t.stop());
@@ -203,10 +213,6 @@ function stopCamera() {
 }
 
 async function start() {
-  if (settings.provider !== "demo" && !settings.apiKey) {
-    alert("Add your API key in Settings (gear icon), or switch to Demo mode.");
-    return;
-  }
   try {
     await startCamera();
   } catch (e) {
@@ -246,6 +252,7 @@ $("recordBtn").onclick = () => (scanning ? stop() : start());
 // Watches the camera on-device and only takes a photo when the view is steady, sharp, and new.
 function watchLoop() {
   if (!scanning) return;
+  if (document.visibilityState !== "visible") return;
   watchTimer = setTimeout(watchLoop, WATCH_MS);
   if (!stream) {
     if (settings.provider === "demo" && Date.now() - lastShotAt > 3000) {
@@ -280,10 +287,34 @@ function watchLoop() {
 
 function enqueue(dataUrl) {
   stats.photos++;
-  const job = { id: `p${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, dataUrl, takenAt: Date.now(), tries: 0 };
+  const job = {
+    id: `p${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    dataUrl,
+    takenAt: Date.now(),
+    tries: 0,
+    ready: !dataUrl,
+  };
+  items.unshift(makePendingItem(job));
+  persist();
+  render();
   queue.push(job);
-  if (dataUrl) savePending(job);
-  pump();
+  if (dataUrl) {
+    savePending(job)
+      .then(async () => {
+        await putPhoto(job.id, await (await fetch(dataUrl)).blob());
+        job.ready = true;
+        pump();
+      })
+      .catch((error) => {
+        console.error("Could not save the captured photo for research:", error);
+        queue.splice(queue.indexOf(job), 1);
+        setPipelineState(job, "failed", `Photo could not be saved locally: ${error.message}`);
+        dropPending(job.id);
+        pump();
+      });
+  } else {
+    pump();
+  }
   updateStatus();
 }
 
@@ -344,9 +375,8 @@ function sceneSignature(canvas) {
 }
 let pumpTimer = null;
 function pump() {
-  if (settings.provider !== "demo" && !settings.apiKey) return;
-  while (inFlight < MAX_IN_FLIGHT && queue.length && Date.now() >= pausedUntil) {
-    const job = queue.pop();
+  while (inFlight < MAX_IN_FLIGHT && queue.length && queue[0].ready !== false && Date.now() >= pausedUntil) {
+    const job = queue.shift();
     inFlight++;
     analyzeJob(job).finally(() => {
       inFlight--;
@@ -363,6 +393,7 @@ const isNetworkError = (e) =>
 
 async function analyzeJob(job) {
   try {
+    setPipelineState(job, "analyzing");
     const found = await analyze(job.dataUrl);
     stats.analyzed++;
     await handleResults(found, job);
@@ -372,145 +403,64 @@ async function analyzeJob(job) {
     job.tries = (job.tries || 0) + 1;
     const offline = isNetworkError(e);
     const limited = e.status === 429 || e.daily;
-    if (job.dataUrl && (offline || limited || e.status >= 500 || job.tries < 5)) {
+    if (job.dataUrl && e.retryable !== false && (offline || limited || e.status >= 500 || job.tries < 5)) {
       queue.push(job);
       const wait = limited ? e.retryAfterMs || 20000 : Math.min(60000, 2000 * 2 ** Math.min(job.tries, 5));
       pausedUntil = Math.max(pausedUntil, Date.now() + wait);
+      setPipelineState(job, "retrying", `Research will retry automatically: ${e.message}`);
     } else {
       dropPending(job.id);
+      setPipelineState(job, "failed", e.message);
     }
     lastError = offline ? "No connection" : e.daily ? e.message : e.status === 429 ? "AI rate limit hit" : e.message;
     lastErrorAt = Date.now();
   }
 }
 
-// ---------- AI providers ----------
-function scanPrompt() {
-  const c = settings.categories || [];
-  return c.length ? PROMPT + `\nONLY report items in these categories: ${c.join(", ")}. Ignore everything else.` : PROMPT;
-}
+// ---------- Backend visual search and pricing ----------
 function normCategory(cat) {
   const k = String(cat || "").toLowerCase();
   return CATEGORIES.find((x) => k.includes(x) || x.includes(k)) || k;
 }
 function categoryAllowed(it) {
   const c = settings.categories || [];
-  return !c.length || it.fromLabel || !!it.status || c.includes(normCategory(it.category));
+  return !!it.pipelineState || !c.length || it.fromLabel || !!it.status || c.includes(normCategory(it.category));
 }
 
-async function analyze(dataUrl, prompt = scanPrompt()) {
-  if (settings.provider === "demo") return demoAnalyze(prompt === LABEL_PROMPT);
+async function analyze(dataUrl, mode = "scan", itemHint = "") {
+  if (settings.provider === "demo") return demoAnalyze(mode === "label");
   if (!dataUrl) throw new Error("camera not ready");
-  const text = settings.provider === "gemini" ? await callGemini(dataUrl.split(",")[1], prompt) : await callOpenAI(dataUrl, prompt);
-  return parseItems(text);
-}
-
-const geminiOutOfQuota = new Map();
-
-async function callGemini(b64, prompt) {
-  const chain = settings.model ? [settings.model] : GEMINI_FALLBACKS;
-  let lastErr;
-  for (let n = 0; n < chain.length; n++) {
-    const idx = (geminiFallbackIdx + n) % chain.length;
-    if ((geminiOutOfQuota.get(chain[idx]) || 0) > Date.now()) continue;
-    try {
-      const text = await callGeminiModel(chain[idx], b64, prompt);
-      geminiFallbackIdx = idx;
-      return text;
-    } catch (e) {
-      lastErr = e;
-      if (e.daily) {
-        geminiOutOfQuota.set(chain[idx], Date.now() + (e.retryAfterMs || 3600000));
-        continue;
-      }
-      if (![404, 500, 503].includes(e.status)) throw e;
-    }
-  }
-  if (!lastErr || lastErr.daily) {
-    const until = Math.min(...chain.map((m) => geminiOutOfQuota.get(m) || Date.now() + 600000));
-    const err = new Error("Free daily AI limit used up");
-    err.status = 429;
-    err.daily = true;
-    err.retryAfterMs = Math.max(60000, until - Date.now());
-    throw err;
-  }
-  throw lastErr;
-}
-
-async function callGeminiModel(model, b64, prompt) {
-  const generationConfig = { responseMimeType: "application/json", temperature: 0.2 };
-  if (!geminiNoThinking.has(model)) generationConfig.thinkingConfig = { thinkingLevel: "low" };
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": settings.apiKey },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: "image/jpeg", data: b64 } }] }],
-        generationConfig,
-      }),
-    }
-  );
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const msg = data.error?.message || "";
-    if (res.status === 400 && /thinking/i.test(msg) && !geminiNoThinking.has(model)) {
-      geminiNoThinking.add(model);
-      return callGeminiModel(model, b64, prompt);
-    }
-    const err = httpError(res, msg);
-    const retry = data.error?.details?.find((d) => d.retryDelay)?.retryDelay;
-    if (retry) err.retryAfterMs = parseFloat(retry) * 1000 + 500;
-    err.daily = res.status === 429 && /PerDay/.test(JSON.stringify(data.error?.details || []));
-    if (!err.daily && err.retryAfterMs) err.retryAfterMs = Math.min(60000, err.retryAfterMs);
-    throw err;
-  }
-  return data.candidates?.[0]?.content?.parts?.map((p) => p.text || "").join("") || "";
-}
-
-async function callOpenAI(dataUrl, prompt) {
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${settings.apiKey}` },
-    body: JSON.stringify({
-      model: settings.model || DEFAULT_MODELS.openai,
-      response_format: { type: "json_object" },
-      temperature: 0.2,
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: prompt },
-            { type: "image_url", image_url: { url: dataUrl, detail: "high" } },
-          ],
-        },
-      ],
-    }),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const err = httpError(res, data.error?.message);
-    const ra = Number(res.headers.get("retry-after"));
-    if (ra) err.retryAfterMs = Math.min(60000, ra * 1000);
-    throw err;
-  }
-  return data.choices?.[0]?.message?.content || "";
-}
-
-function httpError(res, msg) {
-  const e = new Error(msg || `HTTP ${res.status}`);
-  e.status = res.status;
-  return e;
-}
-
-function parseItems(text) {
-  const match = text.match(/\{[\s\S]*\}/);
-  if (!match) return [];
+  const [metadata, image] = dataUrl.split(",");
+  if (!image) throw new Error("The captured photo could not be read.");
+  const mimeType = metadata.match(/^data:(image\/(?:jpeg|png|webp));base64$/)?.[1] || "image/jpeg";
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 70_000);
   try {
-    const arr = JSON.parse(match[0]).items;
-    return Array.isArray(arr) ? arr.filter((i) => i && i.name) : [];
-  } catch {
-    return [];
+    const response = await fetch("/api/analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        image,
+        mimeType,
+        mode,
+        itemHint,
+        categories: settings.categories || [],
+      }),
+      signal: controller.signal,
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const error = new Error(result.error || `Analysis failed (HTTP ${response.status}).`);
+      error.status = response.status;
+      error.retryable = result.retryable !== false;
+      const retryAfter = Number(response.headers.get("retry-after"));
+      if (retryAfter > 0) error.retryAfterMs = retryAfter * 1000;
+      throw error;
+    }
+    if (!Array.isArray(result.items)) throw new Error("The analysis service returned an invalid result.");
+    return result.items.filter((item) => item && typeof item.name === "string" && item.name);
+  } finally {
+    clearTimeout(timeout);
   }
 }
 
@@ -549,32 +499,59 @@ function parseBox(b) {
 function evaluate(raw) {
   const tag = num(raw.tag_price);
   const storeEst = num(raw.est_store_price);
-  const low = num(raw.resale_low) ?? 0;
-  const high = num(raw.resale_high) ?? low;
+  const low = num(raw.resale_low);
+  const high = num(raw.resale_high);
+  const priceKnown = low != null && high != null && high >= low;
   const cost = tag ?? storeEst ?? 0;
-  const resale = (low + high) / 2;
-  const profit = resale * (1 - FEE_RATE) - cost;
+  const resale = priceKnown ? (low + high) / 2 : null;
+  const profit = resale == null ? null : Math.round((resale * (1 - FEE_RATE) - cost) * 100) / 100;
+  const sources = Array.isArray(raw.sources)
+    ? raw.sources.filter((source) => source && typeof (source.url || source.uri) === "string").slice(0, 8)
+    : [];
+  const priceEvidence = String(raw.price_evidence || "").slice(0, 300);
   return {
     name: String(raw.name).slice(0, 120),
+    brand: String(raw.brand || "").slice(0, 80),
+    model: String(raw.model || "").slice(0, 120),
     category: String(raw.category || "").slice(0, 40),
     condition: String(raw.condition || "").slice(0, 40),
     why: String(raw.why || "").slice(0, 200),
+    priceEvidence,
+    lookup: {
+      low: priceKnown ? low : null,
+      high: priceKnown ? high : null,
+      evidence: priceEvidence,
+      sources,
+      at: Date.now(),
+    },
+    priceKnown,
+    estimatedResale: priceKnown
+      ? Math.max(low, Math.min(high, num(raw.resale_estimate) ?? (low + high) / 2))
+      : null,
     labelText: raw.label_text ? String(raw.label_text).slice(0, 200) : "",
     tagPrice: tag,
     cost,
     priceIsEstimate: tag == null,
-    low,
-    high,
-    profit: Math.round(profit * 100) / 100,
+    low: low ?? 0,
+    high: high ?? low ?? 0,
+    profit,
     confidence: num(raw.confidence) ?? 0.5,
     box: parseBox(raw.box_2d),
+    visualSearch: String(raw.visual_search || ""),
+    visualSearchWarning: String(raw.visual_search_warning || "").slice(0, 200),
   };
 }
 function isDeal(it) {
-  return it.profit >= settings.minProfit && it.confidence >= MIN_CONFIDENCE && categoryAllowed(it);
+  return it.priceKnown && it.profit >= settings.minProfit && it.confidence >= MIN_CONFIDENCE && categoryAllowed(it);
 }
 function recomputeDeals() {
-  items.forEach((it) => (it.deal = isDeal(it)));
+  items.forEach((it) => {
+    if (it.priceKnown == null) it.priceKnown = num(it.low) != null && num(it.high) != null;
+    if (it.profit == null && it.priceKnown) {
+      it.profit = Math.round(((it.low + it.high) / 2 * (1 - FEE_RATE) - it.cost) * 100) / 100;
+    }
+    it.deal = isDeal(it);
+  });
 }
 
 function loadImage(src) {
@@ -607,42 +584,44 @@ function cropThumb(img, box) {
 }
 
 async function handleResults(found, job) {
-  if (!found.length) return [];
+  items = items.filter((item) => item.key !== pendingItemKey(job.id));
+  if (!found.length) {
+    persist();
+    render();
+    return [];
+  }
   const img = job.dataUrl ? await loadImage(job.dataUrl).catch(() => null) : null;
+  const wasDeal = new Set(items.filter((it) => it.deal && !it.status).map((it) => it.key));
   let photoSaved = false;
   const savePhoto = async () => {
     if (photoSaved || !job.dataUrl) return;
     photoSaved = true;
     await putPhoto(job.id, await (await fetch(job.dataUrl)).blob()).catch(() => {});
   };
-  const newDeals = [];
   const touched = [];
   for (const raw of found) {
     const ev = evaluate(raw);
-    const key = keyOf(ev.name);
+    const key = keyOf(ev.name) + (ev.confidence < MIN_CONFIDENCE ? ` ${job.id}` : "");
     if (!key) continue;
     const sighting = { photoId: job.dataUrl ? job.id : null, seenAt: job.takenAt, box: ev.box, thumb: img ? cropThumb(img, ev.box) : null };
     let it = items.find((i) => i.key === key);
     if (it) {
-      const wasDeal = it.deal;
       const better = (ev.tagPrice != null && it.tagPrice == null) || ev.confidence > it.confidence;
       if (better) Object.assign(it, ev);
       Object.assign(it, sighting);
-      it.deal = isDeal(it);
-      if (it.deal && !wasDeal && !it.status) newDeals.push(it);
     } else {
       it = { ...ev, key, ...sighting };
-      it.deal = isDeal(it);
       items.unshift(it);
-      if (it.deal) newDeals.push(it);
     }
     if (job.label) it.fromLabel = true;
     touched.push(it);
     if (it.photoId) await savePhoto();
   }
+  touched.forEach((it) => (it.deal = isDeal(it)));
   let kept = 0;
-  items = items.filter((i) => i.status || kept++ < MAX_PHOTOS);
-  if (newDeals.length && !job.label) alertDeal(newDeals[0]);
+  items = items.filter((i) => i.status || i.pipelineState || kept++ < MAX_PHOTOS);
+  const newDeal = touched.find((it) => it.deal && !it.status && !wasDeal.has(it.key));
+  if (newDeal && !job.label) alertDeal(newDeal);
   persist();
   render();
   prunePhotos().catch(() => {});
@@ -653,10 +632,7 @@ async function handleResults(found, job) {
 let snapping = false;
 async function snapLabel() {
   if (snapping) return;
-  if (settings.provider !== "demo" && !settings.apiKey) {
-    alert("Add your API key in Settings (gear icon), or switch to Demo mode.");
-    return;
-  }
+
   const btn = $("labelBtn");
   if (!stream) {
     try {
@@ -677,7 +653,7 @@ async function snapLabel() {
   const frame = captureFrame(LABEL_SIDE, 0.85);
   const job = { id: `p${Date.now()}`, dataUrl: frame?.dataUrl || null, takenAt: Date.now(), label: true };
   try {
-    const found = (await analyze(job.dataUrl, LABEL_PROMPT)).slice(0, 1);
+    const found = (await analyze(job.dataUrl, "label")).slice(0, 1);
     const [it] = await handleResults(found, job);
     if (it) {
       if (it.deal && settings.vibrate) {
@@ -786,7 +762,10 @@ function updateStatus() {
 
 function pricesHtml(it) {
   const priceLabel = it.priceIsEstimate ? `~${money(it.cost)} (no tag)` : money(it.cost);
-  return `<span>Price: ${priceLabel}</span><span>Resells: ${money(it.low)}–${money(it.high)}</span>`;
+  const resaleLabel = it.priceKnown
+    ? `Resale: ~${money(it.estimatedResale ?? (it.low + it.high) / 2)} (${money(it.low)}–${money(it.high)})`
+    : "Resale: no reliable estimate";
+  return `<span>Price: ${priceLabel}</span><span>${resaleLabel}</span>`;
 }
 function itemEl(it) {
   const li = document.createElement("li");
@@ -807,13 +786,19 @@ function itemEl(it) {
   name.textContent = it.name;
   const meta = document.createElement("div");
   meta.className = "meta";
-  meta.textContent = [it.category, it.condition, `${Math.round(it.confidence * 100)}% sure`].filter(Boolean).join(" · ");
+  meta.textContent = it.pipelineState
+    ? (it.pipelineState === "failed" ? "Analysis failed" : "Automatic research")
+    : [it.brand, it.model, it.category, it.condition, `${Math.round(it.confidence * 100)}% sure`].filter(Boolean).join(" · ");
   const prices = document.createElement("div");
   prices.className = "prices";
   prices.innerHTML = pricesHtml(it);
+  const research = document.createElement("div");
+  research.className = "meta";
+  if (it.lookupPending) research.textContent = "Searching Google for recent sold prices…";
+  else if (it.lookupError) research.textContent = it.lookupError;
   const profit = document.createElement("span");
-  profit.className = "profit" + (it.profit < 0 ? " neg" : "");
-  profit.textContent = `Profit: ${money(it.profit)}`;
+  profit.className = "profit" + (it.profit != null && it.profit < 0 ? " neg" : "");
+  profit.textContent = it.profit == null ? "Profit: unavailable" : `Profit: ${money(it.profit)}`;
   prices.appendChild(profit);
   const seen = document.createElement("div");
   seen.className = "seen";
@@ -827,6 +812,20 @@ function itemEl(it) {
   link.rel = "noopener";
   link.textContent = "Check eBay sold prices →";
   info.append(name, meta, prices);
+  if (it.pipelineState) {
+    const pipeline = document.createElement("div");
+    pipeline.className = `pipeline-status ${it.pipelineState}`;
+    pipeline.setAttribute("role", "status");
+    pipeline.setAttribute("aria-live", "polite");
+    pipeline.textContent = {
+      queued: "Queued for automatic identification and pricing",
+      analyzing: "Searching for visual matches and researching resale prices…",
+      retrying: it.why,
+      failed: "Analysis failed. Open this item to retry.",
+    }[it.pipelineState] || "Processing captured photo…";
+    info.append(pipeline);
+  }
+  if (research.textContent) info.append(research);
   if (it.status) {
     const st = document.createElement("div");
     st.className = "haul-status " + it.status;
@@ -857,136 +856,164 @@ async function openViewer(it) {
   }
   $("viewerName").textContent = it.name;
   $("viewerMeta").textContent = `Seen ${ago(it.seenAt)} · ${it.why}` + (it.labelText ? ` · Label: "${it.labelText}"` : "");
-  $("viewerPrices").innerHTML = pricesHtml(it) + `<span class="profit${it.profit < 0 ? " neg" : ""}">Profit: ${money(it.profit)}</span>`;
+  const profitText = it.profit == null ? "Profit: unavailable" : `Profit: ${money(it.profit)}`;
+  $("viewerPrices").innerHTML = pricesHtml(it) + `<span class="profit${it.profit != null && it.profit < 0 ? " neg" : ""}">${profitText}</span>`;
   $("viewerLink").href = ebayUrl(it);
+  $("viewerLink").hidden = !!it.pipelineState;
   renderLookup(it);
   renderViewerActions(it);
   if (!$("viewer").open) $("viewer").showModal();
 }
 
-// ---------- Look it up (Gemini + Google Search) ----------
-const LOOKUP_MODELS = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-flash-lite-latest"];
+// ---------- Automatic price research ----------
 let lookupError = null;
 
-function lookupPrompt(it) {
-  const where = it.box ? ` It is inside box_2d ${JSON.stringify(it.box)} ([ymin, xmin, ymax, xmax], 0-1000 scale).` : "";
-  const label = it.labelText ? ` Its label reads: "${it.labelText}".` : "";
-  return `This photo is from a thrift store. Focus on the item described as "${it.name}".${where}${label}
-1. Identify it as precisely as possible (maker, model or pattern, era).
-2. Use Google Search to find what this item has recently SOLD for (eBay sold listings, Etsy, auctions, Poshmark, Mercari). Prefer sold prices over asking prices.
-Reply ONLY with JSON: {"name": "...", "sold_low": number, "sold_high": number, "evidence": "one short sentence on what you found"}. Use null prices if you found none.`;
-}
-
-const blobToB64 = (blob) =>
+const blobToDataUrl = (blob) =>
   new Promise((resolve, reject) => {
-    const r = new FileReader();
-    r.onload = () => resolve(String(r.result).split(",")[1]);
-    r.onerror = () => reject(r.error);
-    r.readAsDataURL(blob);
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
   });
 
 async function lookupItem(it) {
   if (settings.provider === "demo") {
-    await new Promise((r) => setTimeout(r, 800));
+    await new Promise((resolve) => setTimeout(resolve, 600));
     const mid = Math.max(10, Math.round((it.low + it.high) / 2));
-    return { name: it.name, low: Math.round(mid * 0.8), high: Math.round(mid * 1.3), evidence: "Demo mode: not a real web lookup.", sources: [] };
+    return { name: it.name, low: Math.round(mid * 0.8), high: Math.round(mid * 1.3), evidence: "Demo mode: simulated price, not a real web lookup.", sources: [], confidence: it.confidence };
   }
-  if (settings.provider !== "gemini") throw new Error("Look it up only works with Google Gemini. Switch the AI provider in Settings.");
-  if (!settings.apiKey) throw new Error("Add your Gemini key in Settings first.");
-  const blob = it.photoId ? await getPhoto(it.photoId).catch(() => null) : null;
-  const parts = [{ text: lookupPrompt(it) }];
-  if (blob) parts.push({ inline_data: { mime_type: blob.type || "image/jpeg", data: await blobToB64(blob) } });
-  const chain = [...new Set([settings.model, ...LOOKUP_MODELS].filter(Boolean))];
-  let lastErr;
-  for (const model of chain) {
-    const generationConfig = { temperature: 0.2 };
-    if (!geminiNoThinking.has(model)) generationConfig.thinkingConfig = { thinkingLevel: "low" };
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": settings.apiKey },
-      body: JSON.stringify({ contents: [{ parts }], tools: [{ google_search: {} }], generationConfig }),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok) {
-      const cand = data.candidates?.[0] || {};
-      const text = cand.content?.parts?.map((p) => p.text || "").join("") || "";
-      const m = text.match(/\{[\s\S]*\}/);
-      let j = {};
-      try { j = m ? JSON.parse(m[0]) : {}; } catch {}
-      const sources = (cand.groundingMetadata?.groundingChunks || [])
-        .map((c) => c.web)
-        .filter((w) => w?.uri)
-        .slice(0, 4)
-        .map((w) => ({ title: String(w.title || w.uri).slice(0, 80), uri: w.uri }));
-      return { name: String(j.name || it.name).slice(0, 120), low: num(j.sold_low), high: num(j.sold_high), evidence: String(j.evidence || text).slice(0, 240), sources };
-    }
-    const details = JSON.stringify(data.error?.details || []);
-    lastErr = httpError(res, data.error?.message || "");
-    if (res.status === 400 && /thinking/i.test(lastErr.message) && !geminiNoThinking.has(model)) {
-      geminiNoThinking.add(model);
-      chain.splice(chain.indexOf(model) + 1, 0, model);
-      continue;
-    }
-    if (res.status === 429 && /PerDay/.test(details)) continue;
-    if ((res.status === 429 && !/retryDelay/.test(details)) || res.status === 403) {
-      lastErr.needsBilling = true;
-      continue;
-    }
-    if ([400, 404, 500, 503].includes(res.status)) continue;
-    break;
+  const blob = it.photoId ? await getPhoto(it.photoId) : null;
+  if (!blob) throw new Error("The original photo is no longer available on this device.");
+  const [result] = await analyze(
+    await blobToDataUrl(blob),
+    it.fromLabel ? "label" : "scan",
+    it.pipelineState ? "" : it.name
+  );
+  if (!result) throw new Error("The service could not identify the item from its photo.");
+  const evaluated = evaluate(result);
+  return {
+    name: evaluated.name,
+    brand: evaluated.brand,
+    model: evaluated.model,
+    low: evaluated.priceKnown ? evaluated.low : null,
+    high: evaluated.priceKnown ? evaluated.high : null,
+    estimatedResale: evaluated.estimatedResale,
+    evidence: evaluated.priceEvidence || evaluated.why,
+    sources: result.sources || [],
+    confidence: evaluated.confidence,
+    visualSearchWarning: evaluated.visualSearchWarning,
+    analysis: evaluated,
+  };
+}
+
+function applyLookup(it, result) {
+  const wasPipelineFailure = it.pipelineState === "failed";
+  if (result.analysis) {
+    const preserved = {
+      key: it.key,
+      photoId: it.photoId,
+      thumb: it.thumb,
+      seenAt: it.seenAt,
+      status: it.status,
+      paid: it.paid,
+      boughtAt: it.boughtAt,
+      soldFor: it.soldFor,
+      soldAt: it.soldAt,
+      fromLabel: it.fromLabel,
+    };
+    Object.assign(it, result.analysis, preserved);
+    it.key = keyOf(it.name);
   }
-  throw lastErr || new Error("Lookup failed");
+  const low = num(result.low);
+  const high = num(result.high);
+  it.lookup = { ...result, low, high, at: Date.now() };
+  it.lookupError = "";
+  if (result.name) it.name = result.name;
+  if (result.brand) it.brand = result.brand;
+  if (result.model) it.model = result.model;
+  it.priceKnown = low != null && high != null && high >= low;
+  it.low = low ?? 0;
+  it.high = high ?? low ?? 0;
+  it.estimatedResale = it.priceKnown
+    ? Math.max(low, Math.min(high, num(result.estimatedResale) ?? (low + high) / 2))
+    : null;
+  it.priceEvidence = String(result.evidence || "").slice(0, 300);
+  it.profit = it.priceKnown ? Math.round(((it.low + it.high) / 2 * (1 - FEE_RATE) - it.cost) * 100) / 100 : null;
+  if (num(result.confidence) != null) it.confidence = num(result.confidence);
+  if (result.visualSearchWarning) it.visualSearchWarning = result.visualSearchWarning;
+  if (wasPipelineFailure && !result.analysis) it.key = keyOf(it.name);
+  delete it.pipelineState;
+  it.deal = isDeal(it);
+}
+
+function lookupFailureMessage(error) {
+  return `Automatic price research failed: ${error.message}`;
 }
 
 async function runLookup(it, button) {
   button.disabled = true;
-  button.textContent = "Searching the web…";
+  button.textContent = "Searching the web?";
   lookupError = null;
+  it.lookupError = "";
+  it.lookupPending = true;
+  renderLookup(it);
   try {
-    const r = await lookupItem(it);
-    it.lookup = { ...r, at: Date.now() };
-    if (r.name) it.name = r.name;
-    if (r.low != null) {
-      it.low = r.low;
-      it.high = r.high ?? r.low;
-      it.profit = Math.round(((it.low + it.high) / 2 * (1 - FEE_RATE) - it.cost) * 100) / 100;
-      it.confidence = Math.max(it.confidence, MIN_CONFIDENCE);
-    }
-    it.deal = isDeal(it);
+    applyLookup(it, await lookupItem(it));
+  } catch (error) {
+    console.error(error);
+    it.lookupError = lookupFailureMessage(error);
+    lookupError = { item: it, message: it.lookupError };
+  } finally {
+    it.lookupPending = false;
     persist();
     render();
-  } catch (e) {
-    console.error(e);
-    lookupError = { item: it, message: e.needsBilling
-      ? "Look it up needs billing turned on for your Gemini key (Google doesn't allow web search on free keys). Turn it on at aistudio.google.com/apikey, then try again."
-      : `Lookup failed: ${e.message}` };
+    if (viewerItem === it && $("viewer").open) openViewer(it);
   }
-  if (viewerItem === it && $("viewer").open) openViewer(it);
 }
 
 function renderLookup(it) {
   const box = $("viewerLookup");
   const parts = [];
-  if (lookupError && lookupError.item === it) {
-    const p = document.createElement("div");
-    p.className = "err";
-    p.textContent = lookupError.message;
-    parts.push(p);
-  } else if (it.lookup) {
-    const l = it.lookup;
+  if (it.pipelineState && it.pipelineState !== "failed") {
+    const pending = document.createElement("div");
+    pending.className = "head";
+    pending.textContent = it.why;
+    parts.push(pending);
+  } else if (it.lookupPending) {
+    const pending = document.createElement("div");
+    pending.className = "head";
+    pending.textContent = "Searching Google for current resale prices?";
+    parts.push(pending);
+  } else if ((lookupError && lookupError.item === it) || it.lookupError) {
+    const error = document.createElement("div");
+    error.className = "err";
+    error.textContent = it.lookupError || lookupError.message;
+    parts.push(error);
+  }
+  if (it.visualSearchWarning) {
+    const warning = document.createElement("div");
+    warning.textContent = it.visualSearchWarning;
+    parts.push(warning);
+  }
+  if (it.lookup) {
+    const result = it.lookup;
     const head = document.createElement("div");
     head.className = "head";
-    head.textContent = l.low != null ? `Web lookup: sold ${money(l.low)}–${money(l.high ?? l.low)}` : "Web lookup: no sold prices found";
-    const ev = document.createElement("div");
-    ev.textContent = l.evidence;
-    parts.push(head, ev);
-    for (const s of l.sources || []) {
-      const a = document.createElement("a");
-      a.href = s.uri;
-      a.target = "_blank";
-      a.rel = "noopener";
-      a.textContent = s.title;
-      parts.push(a);
+    head.textContent = result.low != null
+      ? `Web estimate: ${money(result.low)}?${money(result.high ?? result.low)}`
+      : "Web estimate: no reliable price range found";
+    const evidence = document.createElement("div");
+    evidence.textContent = result.evidence || "No pricing evidence was returned.";
+    parts.push(head, evidence);
+    for (const source of result.sources || []) {
+      const url = source.url || source.uri;
+      if (typeof url !== "string" || !/^https?:/i.test(url)) continue;
+      const link = document.createElement("a");
+      link.href = url;
+      link.target = "_blank";
+      link.rel = "noopener";
+      link.textContent = `${source.type === "visual" ? "Visual match: " : "Price research: "}${source.title || url}`;
+      parts.push(link);
     }
   }
   box.replaceChildren(...parts);
@@ -1024,20 +1051,30 @@ function renderViewerActions(it) {
     return b;
   };
   const buttons = [];
-  const look = btn(it.lookup ? "Look up again" : "Look it up", () => runLookup(it, look));
+  const retry = it.pipelineState === "failed";
+  const look = btn(
+    retry ? "Retry identification and pricing" : it.lookup ? "Research again" : "Look it up",
+    () => runLookup(it, look)
+  );
+  look.hidden = !!it.pipelineState && !retry;
+  if (it.lookupPending) {
+    look.disabled = true;
+    look.textContent = "Searching web...";
+  }
   buttons.push(look);
-  if (!it.status) {
+  if (!it.pipelineState && !it.status) {
     buttons.push(btn("I bought it", () => {
       const paid = askPrice("How much did you pay?", it.cost);
       if (paid != null) setHaul(it, { status: "bought", paid, boughtAt: Date.now() });
     }));
-  } else if (it.status === "bought") {
+  } else if (!it.pipelineState && it.status === "bought") {
     buttons.push(btn("Mark sold", () => {
-      const soldFor = askPrice("What did it sell for (before fees)?", Math.round((it.low + it.high) / 2));
+      const fallback = it.priceKnown ? Math.round((it.low + it.high) / 2) : null;
+      const soldFor = askPrice("What did it sell for (before fees)?", fallback);
       if (soldFor != null) setHaul(it, { status: "sold", soldFor, soldAt: Date.now() });
     }));
     buttons.push(btn("Not bought", () => setHaul(it, { status: undefined, paid: undefined, boughtAt: undefined }), "secondary"));
-  } else {
+  } else if (!it.pipelineState && it.status === "sold") {
     buttons.push(btn("Undo sale", () => setHaul(it, { status: "bought", soldFor: undefined, soldAt: undefined }), "secondary"));
   }
   box.replaceChildren(...buttons);
@@ -1050,7 +1087,7 @@ function renderHaul(haul) {
   const unsold = haul.filter((i) => i.status === "bought");
   const spent = haul.reduce((a, i) => a + (i.paid || 0), 0);
   const earned = sold.reduce((a, i) => a + realProfit(i), 0);
-  const potential = unsold.reduce((a, i) => a + i.profit + i.cost - (i.paid || 0), 0);
+  const potential = unsold.reduce((a, i) => a + (i.profit || 0) + i.cost - (i.paid || 0), 0);
   $("haulSummary").innerHTML =
     `<div><b>${money(spent)}</b><span>spent</span></div>` +
     `<div><b class="${earned < 0 ? "neg" : "pos"}">${money(earned)}</b><span>real profit (${sold.length} sold)</span></div>` +
@@ -1112,9 +1149,32 @@ $("clearBtn").onclick = () => {
 };
 
 document.addEventListener("visibilitychange", async () => {
-  if (document.visibilityState === "visible") pump();
-  if (scanning && document.visibilityState === "visible") {
-    try { wakeLock = await navigator.wakeLock?.request("screen"); } catch {}
+  if (document.visibilityState !== "visible") {
+    if (scanning) {
+      clearTimeout(watchTimer);
+      stopCamera();
+      prevSig = null;
+      steadyFor = 0;
+      aiming = false;
+      wakeLock?.release?.();
+      wakeLock = null;
+      setStatus("Paused while app is in the background", false);
+    }
+    return;
+  }
+  pump();
+  if (scanning) {
+    try {
+      await startCamera();
+      prevSig = null;
+      steadyFor = 0;
+      sharpHistory = [];
+      lastSignature = null;
+      wakeLock = await navigator.wakeLock?.request("screen");
+      watchLoop();
+    } catch (error) {
+      setStatus("Camera blocked: " + error.message);
+    }
   }
 });
 setInterval(() => {

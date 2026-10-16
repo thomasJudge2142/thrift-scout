@@ -22,8 +22,8 @@
   <section id="cameraWrap">
     <video id="video" playsinline muted autoplay></video>
     <canvas id="canvas" hidden></canvas>
-    <div id="cameraPlaceholder">Tap <b>Start Scanning</b>, then pause briefly on shelves and racks. It snaps a photo when the view is steady.</div>
-    <div id="status" class="status">Idle</div>
+    <div id="cameraPlaceholder">Tap <b>Start Scanning</b> and slowly point at items. The app automatically snaps a photo when the view is steady, identifies the item, then searches the web for sold prices.</div>
+    <div id="status" class="status" role="status" aria-live="polite">Idle</div>
     <div id="toast" class="toast" hidden></div>
   </section>
 
@@ -53,17 +53,11 @@
       <h2>Settings</h2>
       <label>AI provider
         <select id="provider">
-          <option value="demo">Demo (fake results, no key)</option>
-          <option value="gemini">Google Gemini</option>
-          <option value="openai">OpenAI</option>
+          <option value="demo">Demo (simulated results)</option>
+          <option value="gemini">Live (Google visual search + Gemini)</option>
         </select>
       </label>
-      <label>API key
-        <input id="apiKey" type="password" autocomplete="off" placeholder="Stored only on this phone" />
-      </label>
-      <label>Model
-        <select id="model"></select>
-      </label>
+      <p class="meta">Live mode sends captured photos to the secure app backend. Google Cloud Vision Web Detection searches for visual matches; Gemini identifies the item and researches resale prices with Google Search. API credentials stay on the backend.</p>
       <label>Minimum profit for a deal ($)
         <input id="minProfit" type="number" min="0" step="1" />
       </label>
