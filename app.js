@@ -73,6 +73,17 @@ async function idb(mode, fn, store = "photos") {
 }
 const putPhoto = (id, blob) => idb("readwrite", (s) => s.put(blob, id));
 const getPhoto = (id) => idb("readonly", (s) => s.get(id));
+const deletePhoto = (id) => idb("readwrite", (s) => s.delete(id));
+async function deleteQueuedPhoto(id) {
+  const db = await dbPromise;
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(["photos", "pending"], "readwrite");
+    tx.objectStore("photos").delete(id);
+    tx.objectStore("pending").delete(id);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
 // Photos waiting for analysis are saved until they're analyzed, so they survive app closes and dropped connections.
 const savePending = (job) =>
   idb("readwrite", (s) => s.put({ id: job.id, dataUrl: job.dataUrl, takenAt: job.takenAt, manual: job.manual, label: job.label }, job.id), "pending");
@@ -301,11 +312,21 @@ function enqueue(dataUrl) {
   if (dataUrl) {
     savePending(job)
       .then(async () => {
+        if (job.cancelled) {
+          await dropPending(job.id);
+          return;
+        }
         await putPhoto(job.id, await (await fetch(dataUrl)).blob());
+        if (job.cancelled) {
+          await dropPending(job.id);
+          await deletePhoto(job.id);
+          return;
+        }
         job.ready = true;
         pump();
       })
       .catch((error) => {
+        if (job.cancelled) return;
         console.error("Could not save the captured photo for research:", error);
         queue.splice(queue.indexOf(job), 1);
         setPipelineState(job, "failed", `Photo could not be saved locally: ${error.message}`);
@@ -315,6 +336,33 @@ function enqueue(dataUrl) {
   } else {
     pump();
   }
+  updateStatus();
+}
+
+async function cancelQueuedJob(job, button) {
+  const index = queue.indexOf(job);
+  if (index === -1) return;
+  button.disabled = true;
+  button.textContent = "Cancelling…";
+  job.cancelled = true;
+  queue.splice(index, 1);
+  try {
+    await deleteQueuedPhoto(job.id);
+  } catch (error) {
+    console.error("Could not cancel the queued photo:", error);
+    job.cancelled = false;
+    queue.push(job);
+    queue.sort((a, b) => a.takenAt - b.takenAt);
+    button.disabled = false;
+    button.textContent = "Cancel analysis";
+    flash(`Could not cancel queued photo: ${error.message}`);
+    pump();
+    return;
+  }
+  items = items.filter((item) => item.key !== pendingItemKey(job.id));
+  persist();
+  render();
+  pump();
   updateStatus();
 }
 
@@ -771,7 +819,7 @@ function itemEl(it) {
   const li = document.createElement("li");
   li.className = "item";
   li.onclick = (e) => {
-    if (e.target.tagName !== "A") openViewer(it);
+    if (!(e.target instanceof Element) || !e.target.closest("a, button")) openViewer(it);
   };
   if (it.thumb) {
     const img = document.createElement("img");
@@ -824,6 +872,19 @@ function itemEl(it) {
       failed: "Analysis failed. Open this item to retry.",
     }[it.pipelineState] || "Processing captured photo…";
     info.append(pipeline);
+  }
+  if (it.pipelineState === "queued" || it.pipelineState === "retrying") {
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "cancel-analysis";
+    cancel.textContent = "Cancel analysis";
+    cancel.setAttribute("aria-label", "Cancel analysis of this photo");
+    cancel.onclick = (event) => {
+      event.stopPropagation();
+      const job = queue.find((queued) => pendingItemKey(queued.id) === it.key);
+      if (job) cancelQueuedJob(job, cancel);
+    };
+    info.append(cancel);
   }
   if (research.textContent) info.append(research);
   if (it.status) {

@@ -36,6 +36,8 @@ header h1 { font-size:1.2rem; margin:0; flex:1; }
 .pipeline-status { font-size:.8rem; color:var(--accent); margin-top:.35rem; }
 .pipeline-status.retrying { color:var(--muted); }
 .pipeline-status.failed { color:#f87171; }
+.cancel-analysis { margin-top:.4rem; padding:.35rem .65rem; border:1px solid #475569; border-radius:.5rem; background:transparent; color:var(--muted); cursor:pointer; }
+.cancel-analysis:disabled { opacity:.6; cursor:wait; }
 .item .prices { display:flex; gap:.8rem; font-size:.85rem; margin-top:.3rem; flex-wrap:wrap; }
 .profit { color:var(--green); font-weight:700; }
 .profit.neg { color:var(--red); }

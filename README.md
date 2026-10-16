@@ -35,6 +35,7 @@ The Worker exposes only the same-origin `/api/analyze` endpoint, applies a Cloud
 2. Choose **Live (Google visual search + Gemini)** in Settings.
 3. Tap **Start Scanning** and slowly walk the aisles. The app captures accepted frames automatically and continues scanning until stopped or paused.
 4. Tap a result to inspect the saved photo, estimate, evidence, and source links. The optional **Label** control takes a close-up of a clothing label.
+5. To discard a photo waiting for automatic research, open **All items** and tap **Cancel analysis** on its queued or retrying item. Research already in progress cannot be canceled.
 
 Demo mode works without network access to the AI services and returns simulated results; it does not perform visual or web searches.
 
