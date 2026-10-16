@@ -27,7 +27,7 @@ Live mode uses a Cloudflare Worker so Google credentials are not included in the
    The keys are entered at the prompts and stored by Cloudflare. Never put them in `app.js`, `index.html`, or browser settings.
 3. For local live testing, create an untracked `.dev.vars` file (already git-ignored) with `GEMINI_API_KEY=...` and `VISION_API_KEY=...`. Run `npx wrangler dev`, then deploy with `npx wrangler deploy`.
 
-The Worker exposes only the same-origin `/api/analyze` endpoint, applies a Cloudflare rate limit, limits request size, and sets upstream request timeouts. Provider adapters are isolated in `worker.mjs`; `IDENTIFICATION_PROVIDER` defaults to `google-cloud-vision`, and `PRICING_PROVIDER` defaults to `gemini-google-search`. In live mode, each accepted camera frame is sent to Google Cloud Vision and Gemini for processing; the Worker caches only the result for five minutes, not the image. Results and item photos are stored in the user's browser.
+The Worker exposes only the same-origin `/api/analyze` endpoint, applies a Cloudflare rate limit, limits request size, and sets upstream request timeouts. Provider adapters are isolated in `worker.mjs`; `IDENTIFICATION_PROVIDER` defaults to `google-cloud-vision`, `PRICING_PROVIDER` defaults to `gemini-google-search`, and Gemini uses `gemini-3.8-flash` by default (override with `GEMINI_MODEL`). In live mode, each accepted camera frame is sent to Google Cloud Vision and Gemini for processing; the Worker caches only the result for five minutes, not the image. Results and item photos are stored in the user's browser.
 
 ## Use the app
 

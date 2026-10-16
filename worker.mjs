@@ -207,7 +207,7 @@ export async function identifyWithCloudVision(image, _mimeType, apiKey) {
 }
 
 async function estimateWithGemini(input, visual, env) {
-  const model = env.GEMINI_MODEL || "gemini-2.5-flash";
+  const model = env.GEMINI_MODEL || "gemini-3.8-flash";
   const visualContext = visual.confident
     ? `Google Cloud Vision Web Detection found these likely visual matches: ${JSON.stringify(visual.candidates)}. Related pages: ${JSON.stringify(visual.sources)}. Use them as clues, but verify against the image.`
     : `Google Cloud Vision Web Detection did not return a confident identification. Identify the item directly from the photo. Weak visual-search hints, if any: ${JSON.stringify(visual.candidates)}.`;

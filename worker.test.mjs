@@ -98,6 +98,7 @@ test("falls back to Gemini image research when visual search finds no match", as
     { GEMINI_API_KEY: "server-key", VISION_API_KEY: "vision-key" }
   );
   assert.equal(calls.length, 2);
+  assert.match(calls[1], /\/models\/gemini-3\.8-flash:generateContent$/);
   assert.equal(result.items[0].visual_search, "gemini_fallback");
   assert.equal(result.items[0].name, "Vintage Pyrex Butterprint bowl");
   assert.deepEqual(result.items[0].sources.map((source) => source.type), ["research"]);
